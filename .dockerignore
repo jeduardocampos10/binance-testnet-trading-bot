@@ -1,0 +1,9 @@
+.git
+.gitignore
+config.json
+data/
+*.sqlite3
+__pycache__/
+*.py[cod]
+tests/
+.DS_Store

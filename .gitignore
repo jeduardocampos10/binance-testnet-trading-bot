@@ -1,0 +1,13 @@
+# Local runtime configuration and state (never commit)
+config.json
+data/
+*.sqlite3
+*.sqlite3-*
+secrets/
+*.token
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
