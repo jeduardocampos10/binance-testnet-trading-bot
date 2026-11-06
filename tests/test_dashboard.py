@@ -73,6 +73,10 @@ class DashboardSecurityTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as unauthorized:
             urlopen(base + "/api/setup", timeout=2)
         self.assertEqual(unauthorized.exception.code, 401)
+        self.assertEqual(
+            unauthorized.exception.headers["Strict-Transport-Security"],
+            "max-age=31536000; includeSubDomains",
+        )
 
         credential = base64.b64encode(("admin:" + "a" * 32).encode()).decode()
         headers = {"Authorization": "Basic " + credential, "Content-Type": "application/json"}

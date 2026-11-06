@@ -189,6 +189,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 
     def _authenticate(self) -> bool:
         if self.app.authorized(self.headers.get("Authorization")):
