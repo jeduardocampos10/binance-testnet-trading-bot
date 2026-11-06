@@ -47,6 +47,24 @@ class AuditStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_analyses (
+                id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                candle_close_time INTEGER NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, strategy_version, candle_close_time, snapshot_hash)
+            )
+            """
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS manual_analyses_symbol_id ON manual_analyses(symbol, id DESC)"
+        )
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS paper_account (
@@ -248,6 +266,77 @@ class AuditStore:
         payload = json.loads(row[0])
         payload["recorded_at"] = row[1]
         return payload
+
+    def record_manual_analysis(self, payload: dict[str, Any]) -> tuple[int, bool]:
+        """Persist canonical JSON and return (stable id, newly inserted)."""
+        import hashlib
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        key = (
+            payload["symbol"], payload["strategy_version"],
+            int(payload["candle_close_time"]), payload["snapshot_hash"],
+        )
+        cursor = self._connection.execute(
+            """INSERT OR IGNORE INTO manual_analyses
+                   (symbol, strategy_version, candle_close_time, snapshot_hash, payload_hash, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (*key, digest, text),
+        )
+        inserted = cursor.rowcount == 1
+        if inserted:
+            analysis_id = int(cursor.lastrowid)
+        else:
+            row = self._connection.execute(
+                """SELECT id FROM manual_analyses WHERE symbol = ? AND strategy_version = ?
+                   AND candle_close_time = ? AND snapshot_hash = ?""", key
+            ).fetchone()
+            if row is None:
+                raise sqlite3.IntegrityError("unable to resolve idempotent manual analysis")
+            analysis_id = int(row[0])
+        self._commit()
+        return analysis_id, inserted
+
+    @staticmethod
+    def _manual_row(row: tuple[Any, ...] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        payload = json.loads(row[1])
+        payload.update({"id": row[0], "payload_hash": row[2], "recorded_at": row[3]})
+        return payload
+
+    def manual_analysis_by_id(self, analysis_id: int) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT id, payload_json, payload_hash, recorded_at FROM manual_analyses WHERE id = ?",
+            (analysis_id,),
+        ).fetchone()
+        return self._manual_row(row)
+
+    def latest_manual_analysis(self, symbol: str | None = None) -> dict[str, Any] | None:
+        if symbol is None:
+            row = self._connection.execute(
+                "SELECT id, payload_json, payload_hash, recorded_at FROM manual_analyses ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                """SELECT id, payload_json, payload_hash, recorded_at FROM manual_analyses
+                   WHERE symbol = ? ORDER BY id DESC LIMIT 1""", (symbol,)
+            ).fetchone()
+        return self._manual_row(row)
+
+    def list_manual_analyses(self, symbol: str | None = None, *, limit: int = 50) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 200:
+            raise ValueError("manual analysis history limit must be between 1 and 200")
+        if symbol is None:
+            rows = self._connection.execute(
+                """SELECT id, payload_json, payload_hash, recorded_at FROM manual_analyses
+                   ORDER BY id DESC LIMIT ?""", (limit,)
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """SELECT id, payload_json, payload_hash, recorded_at FROM manual_analyses
+                   WHERE symbol = ? ORDER BY id DESC LIMIT ?""", (symbol, limit)
+            ).fetchall()
+        return [item for row in rows if (item := self._manual_row(row)) is not None]
 
     def ensure_paper_account(self, initial_equity: str, config_hash: str) -> None:
         self._connection.execute(

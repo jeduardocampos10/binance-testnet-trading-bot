@@ -9,6 +9,9 @@ services:
     # Intentionally no `ports:` mapping: attach the Coolify HTTPS proxy privately.
     volumes:
       - dashboard_data:/data
+      # /dev/null keeps both optional; set both OPENAI_*_FILE variables to enable.
+      - ${OPENAI_API_KEY_FILE:-/dev/null}:/run/secrets/openai_api_key:ro
+      - ${OPENAI_MODEL_FILE:-/dev/null}:/run/secrets/openai_model:ro
     secrets:
       - dashboard_auth_token
     read_only: true

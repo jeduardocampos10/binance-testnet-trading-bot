@@ -36,7 +36,7 @@ class DashboardSecurityTests(unittest.TestCase):
     def test_setup_exposes_only_predefined_actions(self) -> None:
         app = self._app()
         setup = app.setup()
-        self.assertEqual(setup["allowed_actions"], ["observe", "paper", "pause", "resume", "export"])
+        self.assertEqual(setup["allowed_actions"], ["observe", "paper", "manual_analysis", "pause", "resume", "export"])
         self.assertIn("shell", setup["forbidden_actions"])
         self.assertFalse(setup["orders_enabled"])
         self.assertEqual(setup["configuration"]["strategy_version"], "monthly-top20-trend-cross-v0.5-crypto-only")

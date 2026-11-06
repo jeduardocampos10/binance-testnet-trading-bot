@@ -93,3 +93,7 @@ Leia [DASHBOARD.md](DASHBOARD.md) antes de testar ou publicar. Não exponha a po
 5. Nunca promover automaticamente por tempo ou rentabilidade.
 
 Leia também [SPEC.md](SPEC.md) e [DASHBOARD.md](DASHBOARD.md).
+
+## Análise manual Top 10 (consultiva)
+
+O dashboard oferece uma análise manual de um ativo que pertença ao Top 10 de uma observação nova. O relatório combina ranking, decisão e plano de risco determinísticos, barra fechada, perfil de sessão e verificações de integridade. Quando configurada, a OpenAI Responses API fornece apenas uma avaliação estruturada consultiva; ela não altera símbolo, quantidade, stop ou alvo e o projeto não expõe qualquer capacidade de ordem. Sem os dois secrets OpenAI, o dashboard continua funcionando e a avaliação fica `INCONCLUSIVE`.

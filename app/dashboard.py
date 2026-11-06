@@ -10,6 +10,8 @@ import json
 import secrets
 import sqlite3
 import threading
+import time
+import re
 from dataclasses import asdict
 from decimal import Decimal
 from http import HTTPStatus
@@ -20,6 +22,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from .analytics import build_analytics
 from .config import load_settings
+from .manual_analysis import run_manual_analysis
+from .openai_advisor import OpenAIAdvisor
 from .service import run_analysis_cycle
 from .state import AuditStore
 
@@ -48,10 +52,18 @@ def _read_token(path: Path) -> str:
 
 
 class DashboardApplication:
-    def __init__(self, config_path: Path, db_path: Path, token: str) -> None:
+    def __init__(self, config_path: Path, db_path: Path, token: str, *,
+                 openai_api_key_file: Path | None = None,
+                 openai_model_file: Path | None = None,
+                 advisor: OpenAIAdvisor | None = None) -> None:
         self.config_path = config_path.resolve()
         self.db_path = db_path.resolve()
         self.token = token
+        if (openai_api_key_file is None) != (openai_model_file is None):
+            raise ValueError("OpenAI API key and model files must be configured together")
+        self.advisor = advisor
+        if self.advisor is None and openai_api_key_file is not None and openai_model_file is not None:
+            self.advisor = OpenAIAdvisor.from_files(openai_api_key_file, openai_model_file)
         self.csrf_token = hmac.new(token.encode(), b"paper-dashboard-csrf-v1", hashlib.sha256).hexdigest()
         self._action_lock = threading.Lock()
         self._job_lock = threading.Lock()
@@ -73,22 +85,32 @@ class DashboardApplication:
         with self._job_lock:
             return dict(self._job)
 
-    def start_cycle(self, action: str) -> bool:
-        if action not in {"observe", "paper"} or not self._action_lock.acquire(blocking=False):
+    def start_cycle(self, action: str, symbol: str | None = None) -> bool:
+        if action not in {"observe", "paper", "manual_analysis"}:
+            return False
+        if action == "manual_analysis":
+            symbol = self.validate_symbol(symbol)
+        if not self._action_lock.acquire(blocking=False):
             return False
         with self._job_lock:
-            self._job = {"running": True, "action": action, "result": None, "error": None}
+            self._job = {"running": True, "action": action, "symbol": symbol, "result": None, "error": None}
 
         def worker() -> None:
             try:
-                result = run_analysis_cycle(self.config_path, self.db_path, paper=action == "paper")
+                if action == "manual_analysis":
+                    result = run_manual_analysis(self.config_path, self.db_path, symbol or "", advisor=self.advisor)
+                else:
+                    result = run_analysis_cycle(self.config_path, self.db_path, paper=action == "paper")
                 summary = {
-                    "mode": result.get("mode"),
+                    "mode": result.get("mode", action),
                     "generated_at_ms": result.get("generated_at_ms"),
                     "equity_usdt": result.get("equity_usdt"),
                     "daily_pnl_usdt": result.get("daily_pnl_usdt"),
                     "open_positions": len(result.get("open_positions", [])),
                     "entry_candidates": result.get("entry_candidates", []),
+                    "analysis_id": result.get("id"),
+                    "symbol": result.get("symbol"),
+                    "final_verdict": result.get("final_verdict"),
                 }
                 with self._job_lock:
                     self._job = {"running": False, "action": action, "result": summary, "error": None}
@@ -100,6 +122,41 @@ class DashboardApplication:
 
         threading.Thread(target=worker, name=f"dashboard-{action}", daemon=True).start()
         return True
+
+    @staticmethod
+    def validate_symbol(symbol: Any) -> str:
+        if not isinstance(symbol, str):
+            raise ValueError("symbol must be text")
+        normalized = symbol.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{5,20}", normalized):
+            raise ValueError("invalid symbol")
+        return normalized
+
+    def manual_top10(self) -> dict[str, Any]:
+        store = AuditStore(self.db_path)
+        try:
+            report = store.latest_report()
+        finally:
+            store.close()
+        if report is None:
+            return {"generated_at_ms": None, "age_ms": None, "needs_update": True, "top10": []}
+        age = max(0, int(time.time() * 1000) - int(report["generated_at_ms"]))
+        return {"generated_at_ms": report["generated_at_ms"], "age_ms": age,
+                "needs_update": age > 15 * 60 * 1000, "top10": report.get("ranking", [])[:10]}
+
+    def manual_latest(self, symbol: str) -> dict[str, Any] | None:
+        store = AuditStore(self.db_path)
+        try:
+            return store.latest_manual_analysis(self.validate_symbol(symbol))
+        finally:
+            store.close()
+
+    def manual_history(self, symbol: str) -> list[dict[str, Any]]:
+        store = AuditStore(self.db_path)
+        try:
+            return store.list_manual_analyses(self.validate_symbol(symbol), limit=50)
+        finally:
+            store.close()
 
     def set_paused(self, paused: bool, reason: str | None) -> dict[str, Any]:
         store = AuditStore(self.db_path)
@@ -118,6 +175,8 @@ class DashboardApplication:
                 "control": store.paper_control(),
                 "latest": latest,
                 "orders_enabled": False,
+                "llm_enabled": self.advisor is not None,
+                "model": self.advisor.model if self.advisor is not None else None,
             }
         finally:
             store.close()
@@ -139,9 +198,11 @@ class DashboardApplication:
         return {
             "configuration": _json_safe(asdict(settings)),
             "control": control,
-            "allowed_actions": ["observe", "paper", "pause", "resume", "export"],
-            "forbidden_actions": ["shell", "testnet_order", "production_order", "config_mutation_with_active_db"],
+            "allowed_actions": ["observe", "paper", "manual_analysis", "pause", "resume", "export"],
+            "forbidden_actions": ["shell", "testnet_order", "production_order", "orders", "config_mutation_with_active_db"],
             "orders_enabled": False,
+            "llm_enabled": self.advisor is not None,
+            "model": self.advisor.model if self.advisor is not None else None,
         }
 
     def export(self, kind: str) -> dict[str, Any]:
@@ -243,7 +304,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path)
         if path.path == "/health":
-            self._send_json({"status": "ok", "mode": "PAPER", "orders_enabled": False})
+            self._send_json({"status": "ok", "mode": "PAPER", "orders_enabled": False,
+                             "llm_enabled": self.app.advisor is not None,
+                             "model": self.app.advisor.model if self.app.advisor is not None else None})
             return
         if not self._authenticate():
             return
@@ -257,6 +320,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(self.app.analytics(period))
             elif path.path == "/api/setup":
                 self._send_json(self.app.setup())
+            elif path.path == "/api/manual/top10":
+                self._send_json(self.app.manual_top10())
+            elif path.path == "/api/manual/latest":
+                symbol = parse_qs(path.query).get("symbol", [""])[0]
+                self._send_json(self.app.manual_latest(symbol) or {"status": "not_found"})
+            elif path.path == "/api/manual/history":
+                symbol = parse_qs(path.query).get("symbol", [""])[0]
+                self._send_json({"analyses": self.app.manual_history(symbol)})
             elif path.path == "/api/export":
                 kind = parse_qs(path.query).get("kind", ["paper"])[0]
                 self._send_json(self.app.export(kind), attachment=f"{kind}-report.json")
@@ -276,7 +347,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             payload = self._body()
             path = urlsplit(self.path).path
-            if path == "/api/actions/run":
+            if path == "/api/manual/analyze":
+                if set(payload) != {"symbol"}:
+                    raise ValueError("body must contain exactly symbol")
+                symbol = self.app.validate_symbol(payload["symbol"])
+                if not self.app.start_cycle("manual_analysis", symbol):
+                    self._send_json({"error": "another action is already running"}, 409)
+                    return
+                self._send_json({"accepted": True, "action": "manual_analysis", "symbol": symbol,
+                                 "orders_enabled": False}, 202)
+            elif path == "/api/actions/run":
                 action = payload.get("action")
                 if not isinstance(action, str) or action not in {"observe", "paper"}:
                     raise ValueError("invalid predefined action")
@@ -325,6 +405,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True)
     parser.add_argument("--db", required=True)
     parser.add_argument("--auth-token-file", required=True)
+    parser.add_argument("--openai-api-key-file")
+    parser.add_argument("--openai-model-file")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     return parser
@@ -335,7 +417,13 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.port <= 65535:
         raise SystemExit("invalid port")
     token = _read_token(Path(args.auth_token_file))
-    app = DashboardApplication(Path(args.config), Path(args.db), token)
+    if bool(args.openai_api_key_file) != bool(args.openai_model_file):
+        raise SystemExit("OpenAI API key and model files must be provided together")
+    app = DashboardApplication(
+        Path(args.config), Path(args.db), token,
+        openai_api_key_file=Path(args.openai_api_key_file) if args.openai_api_key_file else None,
+        openai_model_file=Path(args.openai_model_file) if args.openai_model_file else None,
+    )
     server = DashboardServer((args.host, args.port), app)
     print(f"PAPER dashboard listening on {args.host}:{args.port}; orders_enabled=false")
     try:
@@ -354,18 +442,19 @@ DASHBOARD_HTML = r'''<!doctype html>
 :root{--bg:#08111f;--panel:#101c2d;--line:#26364d;--text:#e8eef8;--muted:#91a3bc;--green:#3ddc97;--red:#ff667a;--amber:#ffc857;--blue:#66a3ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,Arial}.wrap{max-width:1440px;margin:auto;padding:20px}.banner{background:#17253a;border:1px solid var(--line);padding:12px;border-radius:10px;margin-bottom:16px}.banner b{color:var(--green)}nav{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}button,.button{border:1px solid var(--line);background:#16263d;color:var(--text);padding:9px 13px;border-radius:8px;cursor:pointer;text-decoration:none}button:hover,.button:hover{border-color:var(--blue)}button.danger{border-color:#653343;color:#ffb2bd}.active{background:#234873}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;overflow:auto}.metric{font-size:25px;font-weight:700;margin-top:6px}.muted{color:var(--muted)}.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);white-space:nowrap}section{display:none;margin-top:12px}section.show{display:block}.wide{grid-column:span 2}.full{grid-column:1/-1}canvas{width:100%;height:240px;background:#0b1626;border-radius:8px}pre{white-space:pre-wrap;word-break:break-word}.status{padding:8px;border-radius:7px;background:#0b1626;margin:8px 0}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wide{grid-column:span 2}}@media(max-width:560px){.grid{grid-template-columns:1fr}.wide,.full{grid-column:span 1}}
 </style></head><body><div class="wrap">
 <h1>Cashmaxx — PAPER Analytics</h1><div class="banner"><b>Dados:</b> Binance Spot público &nbsp; <b>Execução:</b> PAPER &nbsp; <b>Alvo futuro:</b> Binance Spot Testnet &nbsp; <b>Ordens:</b> NÃO HABILITADAS</div>
-<nav><button data-tab="overview" class="active">Visão geral</button><button data-tab="performance">Resultados</button><button data-tab="trends">Tendências</button><button data-tab="setup">Setup e ações</button></nav>
+<nav><button data-tab="overview" class="active">Visão geral</button><button data-tab="performance">Resultados</button><button data-tab="trends">Tendências</button><button data-tab="manual">Análise manual</button><button data-tab="setup">Setup e ações</button></nav>
 <div id="periods"><button data-period="day">Dia</button><button data-period="week">Semana</button><button data-period="month" class="active">Mês</button><button data-period="all">Tudo</button></div>
 <section id="overview" class="show"><div class="grid"><div class="card"><span class="muted">Patrimônio</span><div id="equity" class="metric">—</div></div><div class="card"><span class="muted">Resultado do período</span><div id="pnl" class="metric">—</div></div><div class="card"><span class="muted">Retorno</span><div id="return" class="metric">—</div></div><div class="card"><span class="muted">Drawdown máximo</span><div id="drawdown" class="metric">—</div></div><div class="card wide"><h3>Curva de patrimônio</h3><canvas id="chart" width="800" height="240"></canvas></div><div class="card wide"><h3>Posições abertas</h3><table><thead><tr><th>Ativo</th><th>Entrada</th><th>Marca</th><th>P&L</th><th>Stop</th></tr></thead><tbody id="positions"></tbody></table></div></div></section>
 <section id="performance"><div class="grid"><div class="card"><span class="muted">Trades encerrados</span><div id="trades" class="metric">—</div></div><div class="card"><span class="muted">Taxa de acerto</span><div id="winrate" class="metric">—</div></div><div class="card"><span class="muted">Melhor ativo</span><div id="best" class="metric">—</div></div><div class="card"><span class="muted">Pior ativo</span><div id="worst" class="metric">—</div></div><div class="card full"><h3>Resultado por ativo</h3><table><thead><tr><th>Ativo</th><th>Trades</th><th>Vitórias</th><th>Perdas</th><th>P&L</th></tr></thead><tbody id="assets"></tbody></table></div><div class="card full"><h3>Resultados diários</h3><table><thead><tr><th>Dia UTC</th><th>Patrimônio</th><th>P&L diário</th><th>%</th></tr></thead><tbody id="daily"></tbody></table></div></div></section>
 <section id="trends"><div class="grid"><div class="card wide"><h3>Novas tendências e sinais</h3><table><thead><tr><th>Ativo</th><th>Sinal</th><th>Razões</th></tr></thead><tbody id="emerging"></tbody></table></div><div class="card wide"><h3>Ranking elegível</h3><table><thead><tr><th>#</th><th>Ativo</th><th>Score</th><th>30 dias</th></tr></thead><tbody id="ranking"></tbody></table></div><div class="card full"><h3>Rejeições de dados</h3><pre id="rejections">—</pre></div></div></section>
+<section id="manual"><div class="grid"><div class="card full"><h3>Top 10 da observação</h3><div id="manualFreshness" class="status">Carregando…</div><button id="refreshRanking">Atualizar ranking (OBSERVATION)</button> <select id="manualSymbol" aria-label="Ativo Top 10"></select> <button id="analyzeManual">Analisar ativo</button><p class="muted">A IA é somente consultiva. Símbolo, quantidade, stop e alvo determinísticos não podem ser alterados. Nenhuma ordem é criada.</p></div><div class="card wide"><h3>Relatório detalhado</h3><pre id="manualReport">—</pre></div><div class="card wide"><h3>Histórico</h3><pre id="manualHistory">—</pre></div></div></section>
 <section id="setup"><div class="grid"><div class="card wide"><h3>Controles operacionais</h3><div id="job" class="status">Nenhuma ação em execução</div><button id="runObserve">Executar OBSERVATION</button> <button id="runPaper">Executar PAPER</button><br><br><input id="pauseReason" placeholder="Motivo da pausa" maxlength="200"> <button id="pauseEntries" class="danger">Pausar entradas</button> <button id="resumeEntries">Retomar entradas</button></div><div class="card wide"><h3>Exportação</h3><a class="button" href="/api/export?kind=paper">Relatório PAPER</a> <a class="button" href="/api/export?kind=observation">Observação</a><p class="muted">Não existe terminal, comando arbitrário ou botão de ordem.</p></div><div class="card full"><h3>Configuração validada (somente leitura)</h3><pre id="config">Carregando…</pre></div></div></section>
 </div><script nonce="__NONCE__">
 const csrf=document.querySelector('meta[name=csrf-token]').content;let period='month',data=null;const q=s=>document.querySelector(s);function txt(id,v){q(id).textContent=v??'—'}function money(v){return `${Number(v||0).toFixed(4)} USDT`}function color(el,v){el.classList.remove('green','red');el.classList.add(Number(v)>=0?'green':'red')}function rows(id,items,fn){const body=q(id);body.textContent='';for(const item of items){const tr=document.createElement('tr');for(const value of fn(item)){const td=document.createElement('td');td.textContent=value??'';tr.appendChild(td)}body.appendChild(tr)}}
 async function api(url,opt={}){const r=await fetch(url,opt);const j=await r.json();if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j}function draw(series){const c=q('#chart'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);if(!series.length)return;const vals=series.map(v=>Number(v.equity_usdt));const lo=Math.min(...vals),hi=Math.max(...vals),span=hi-lo||1;x.strokeStyle='#3ddc97';x.lineWidth=3;x.beginPath();vals.forEach((v,i)=>{const px=20+i*(c.width-40)/Math.max(1,vals.length-1),py=20+(hi-v)*(c.height-40)/span;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}
 async function load(){data=await api(`/api/analytics?period=${period}`);txt('#equity',money(data.final_equity_usdt));txt('#pnl',money(data.period_pnl_usdt));color(q('#pnl'),data.period_pnl_usdt);txt('#return',`${Number(data.period_return_pct).toFixed(3)}%`);color(q('#return'),data.period_return_pct);txt('#drawdown',`${Number(data.max_drawdown_pct).toFixed(3)}%`);txt('#trades',data.closed_trades);txt('#winrate',`${Number(data.win_rate_pct).toFixed(2)}%`);txt('#best',data.best_asset?`${data.best_asset.symbol} (${money(data.best_asset.realized_pnl_usdt)})`:'—');txt('#worst',data.worst_asset?`${data.worst_asset.symbol} (${money(data.worst_asset.realized_pnl_usdt)})`:'—');rows('#positions',data.open_positions,p=>[p.symbol,p.entry_price,p.mark_price,p.unrealized_pnl_usdt,p.trailing_stop||p.hard_stop]);rows('#assets',data.asset_performance,a=>[a.symbol,a.trades,a.wins,a.losses,a.realized_pnl_usdt]);rows('#daily',data.equity_series,d=>[d.risk_day_utc,d.equity_usdt,d.daily_pnl_usdt,d.daily_pnl_pct]);rows('#emerging',data.emerging_trends,t=>[t.symbol,t.signal,(t.reasons||[]).join('; ')]);rows('#ranking',data.eligible_ranked,r=>[r.rank,r.symbol,r.score,r.return_30d_pct]);txt('#rejections',JSON.stringify(data.skipped_reasons,null,2));draw(data.equity_series)}
-async function setup(){const s=await api('/api/setup');txt('#config',JSON.stringify(s,null,2));await poll()}async function post(url,body){return api(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)})}async function runAction(action){try{await post('/api/actions/run',{action});await poll()}catch(e){alert(e.message)}}async function pauseEntries(){try{await post('/api/actions/pause',{reason:q('#pauseReason').value});await setup()}catch(e){alert(e.message)}}async function resumeEntries(){try{await post('/api/actions/resume',{});await setup()}catch(e){alert(e.message)}}async function poll(){const s=await api('/api/status');txt('#job',s.job.running?`Executando ${s.job.action}…`:s.job.error?`Falha: ${s.job.error}`:s.job.result?`Concluído: ${JSON.stringify(s.job.result)}`:`Entradas pausadas: ${s.control.paused}`);if(s.job.running)setTimeout(poll,3000);else load()}
-document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('section').forEach(s=>s.classList.remove('show'));q('#'+b.dataset.tab).classList.add('show');document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));b.classList.add('active');if(b.dataset.tab==='setup')setup()}));document.querySelectorAll('[data-period]').forEach(b=>b.addEventListener('click',()=>{period=b.dataset.period;document.querySelectorAll('[data-period]').forEach(x=>x.classList.remove('active'));b.classList.add('active');load()}));q('#runObserve').addEventListener('click',()=>runAction('observe'));q('#runPaper').addEventListener('click',()=>runAction('paper'));q('#pauseEntries').addEventListener('click',pauseEntries);q('#resumeEntries').addEventListener('click',resumeEntries);load();poll();
+async function setup(){const s=await api('/api/setup');txt('#config',JSON.stringify(s,null,2));await poll()}async function post(url,body){return api(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)})}const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));function showJob(s){txt('#job',s.job.running?`Executando ${s.job.action}…`:s.job.error?`Falha: ${s.job.error}`:s.job.result?`Concluído: ${JSON.stringify(s.job.result)}`:`Entradas pausadas: ${s.control.paused}`)}async function waitForIdle(){for(let i=0;i<240;i++){const s=await api('/api/status');showJob(s);if(!s.job.running){if(s.job.error)throw new Error(s.job.error);await load();return s}await sleep(3000)}throw new Error('tempo limite aguardando a ação')}async function runAction(action){try{await post('/api/actions/run',{action});return await waitForIdle()}catch(e){alert(e.message);throw e}}async function loadManualRanking(){try{const r=await api('/api/manual/top10'),sel=q('#manualSymbol'),selected=sel.value;sel.textContent='';for(const item of r.top10){const option=document.createElement('option');option.value=item.symbol;option.textContent=`#${item.rank} ${item.symbol} — score ${item.score}`;sel.appendChild(option)}if(selected&&Array.from(sel.options).some(option=>option.value===selected))sel.value=selected;txt('#manualFreshness',r.generated_at_ms?`Idade: ${r.age_ms} ms${r.needs_update?' — atualização recomendada':''}`:'Sem observação; atualize o ranking.');q('#analyzeManual').disabled=!r.top10.length;if(r.top10.length)await loadManualReport()}catch(e){txt('#manualFreshness',`Falha: ${e.message}`)}}async function loadManualReport(){const symbol=q('#manualSymbol').value;if(!symbol)return;const latest=await api(`/api/manual/latest?symbol=${encodeURIComponent(symbol)}`),history=await api(`/api/manual/history?symbol=${encodeURIComponent(symbol)}`);txt('#manualReport',latest.status==='not_found'?'Sem análise para este ativo.':JSON.stringify(latest,null,2));txt('#manualHistory',JSON.stringify(history.analyses,null,2))}async function analyzeManual(){try{const symbol=q('#manualSymbol').value;if(!symbol)return;await post('/api/manual/analyze',{symbol});await waitForIdle();await loadManualReport()}catch(e){alert(e.message)}}async function refreshRanking(){try{await runAction('observe');await loadManualRanking()}catch(e){}}async function pauseEntries(){try{await post('/api/actions/pause',{reason:q('#pauseReason').value});await setup()}catch(e){alert(e.message)}}async function resumeEntries(){try{await post('/api/actions/resume',{});await setup()}catch(e){alert(e.message)}}async function poll(){const s=await api('/api/status');showJob(s);if(s.job.running)setTimeout(poll,3000);else load()}
+document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('section').forEach(s=>s.classList.remove('show'));q('#'+b.dataset.tab).classList.add('show');document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));b.classList.add('active');if(b.dataset.tab==='setup')setup();if(b.dataset.tab==='manual')loadManualRanking()}));document.querySelectorAll('[data-period]').forEach(b=>b.addEventListener('click',()=>{period=b.dataset.period;document.querySelectorAll('[data-period]').forEach(x=>x.classList.remove('active'));b.classList.add('active');load()}));q('#runObserve').addEventListener('click',()=>runAction('observe'));q('#runPaper').addEventListener('click',()=>runAction('paper'));q('#pauseEntries').addEventListener('click',pauseEntries);q('#resumeEntries').addEventListener('click',resumeEntries);q('#refreshRanking').addEventListener('click',refreshRanking);q('#analyzeManual').addEventListener('click',analyzeManual);q('#manualSymbol').addEventListener('change',loadManualReport);load();poll();
 </script></body></html>'''
 
 

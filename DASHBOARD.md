@@ -89,3 +89,18 @@ O botão PAPER é manual. Para uma rodada diária, use uma tarefa agendada do Co
 ## Domínio recomendado
 
 Use `paper.artgenial.com.br`, terminado em HTTPS pelo proxy do Coolify. Não publique a porta 8080 diretamente e ative HSTS após confirmar que o domínio funciona somente por HTTPS.
+
+## IA opcional para a aba “Análise manual”
+
+Monte os arquivos regulares (não symlinks) `/run/secrets/openai_api_key` e `/run/secrets/openai_model`. No Compose, crie localmente `secrets/openai_api_key` e `secrets/openai_model` (ambos ignorados pelo Git), defina `OPENAI_API_KEY_FILE=./secrets/openai_api_key` e `OPENAI_MODEL_FILE=./secrets/openai_model`; o segundo arquivo contém somente o model ID habilitado. Sem essas variáveis, `/dev/null` é montado e a IA permanece desabilitada. Os dois arquivos são necessários em conjunto. Para executar sem IA, não passe `--openai-api-key-file` nem `--openai-model-file`; o dashboard permanece operacional e sem ordens.
+
+Exemplo direto:
+
+```sh
+python -m app.dashboard --config /data/config.json --db /data/paper.sqlite3 \
+  --auth-token-file /run/secrets/dashboard_auth_token \
+  --openai-api-key-file /run/secrets/openai_api_key \
+  --openai-model-file /run/secrets/openai_model
+```
+
+A UI e `/health` mostram apenas `llm_enabled` e o model ID, nunca a chave.

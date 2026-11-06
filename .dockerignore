@@ -7,3 +7,7 @@ __pycache__/
 *.py[cod]
 tests/
 .DS_Store
+
+secrets/
+*.key
+*.secret

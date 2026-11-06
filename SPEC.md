@@ -107,3 +107,11 @@ Dados externos poderão incluir CoinGecko para capitalização/volume, CryptoPan
 ## Limitações dos ambientes
 
 O Testnet pode ser resetado e é usado apenas para elegibilidade do universo e como alvo de uma eventual execução futura. Candles, liquidez e spreads da análise vêm do mercado Spot público principal; fills, taxas e slippage continuam simulados e não demonstram rentabilidade futura. Dados reais de mercado não significam execução real. Uma eventual versão para dinheiro real será outro projeto e exigirá nova revisão.
+
+## Fase 1 — análise manual Top 10 com IA
+
+- Cada análise executa e persiste uma OBSERVATION fresca e só aceita os dez primeiros do ranking dessa observação.
+- `OPPORTUNITY` exige simultaneamente `ENTRY_CANDIDATE`, todos os checks de integridade em `PASS` e avaliação OpenAI válida `OPPORTUNITY`; qualquer inconsistência falha de forma fechada.
+- A integração usa `POST https://api.openai.com/v1/responses`, Structured Outputs estrito e nenhum tool/function calling ou web search.
+- Relatórios canônicos e hashes são persistidos com idempotência por símbolo, versão, fechamento da vela e snapshot.
+- A funcionalidade é exclusivamente consultiva; `orders_enabled=false` permanece invariável.
