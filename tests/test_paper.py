@@ -162,6 +162,111 @@ class PaperPortfolioTests(unittest.TestCase):
         self.assertEqual(exits[0]["payload"]["reason"], "PROTECTIVE_STOP")
         self.assertGreater(Decimal(exits[0]["payload"]["realized_pnl_usdt"]), Decimal("0"))
 
+    def test_profit_lock_protects_configured_net_floor_without_a_gap(self) -> None:
+        config = replace(
+            self.settings,
+            profit_lock_activation_pct=Decimal("4"),
+            minimum_locked_profit_pct=Decimal("2"),
+        )
+        first = 131 * DAY_MS
+        run_paper_cycle(
+            report(
+                first,
+                (entry_decision("AAAUSDT", "100", first - 1),),
+                (bar("AAAUSDT", 130, "100", "101", "99", "100"),),
+            ),
+            config,
+            self.store,
+        )
+        second = 132 * DAY_MS
+        run_paper_cycle(
+            report(
+                second,
+                (no_entry_decision("AAAUSDT", "104", second - 1),),
+                (bar("AAAUSDT", 131, "100", "104.2", "99", "104"),),
+            ),
+            config,
+            self.store,
+        )
+        position = self.store.open_positions()[0]
+        locked_stop = Decimal(position["trailing_stop"])
+        self.assertGreater(locked_stop, Decimal("102"))
+
+        third = 133 * DAY_MS
+        payload = run_paper_cycle(
+            report(
+                third,
+                (no_entry_decision("AAAUSDT", "102.3", third - 1),),
+                (bar("AAAUSDT", 132, "102.4", "103", "102", "102.3"),),
+            ),
+            config,
+            self.store,
+        )
+        exit_event = [item for item in payload["events_today"] if item["event_type"] == "PAPER_EXIT"][0]
+        self.assertEqual(exit_event["payload"]["reason"], "PROTECTIVE_STOP")
+        self.assertGreater(Decimal(exit_event["payload"]["realized_pnl_usdt"]), Decimal("0.19"))
+        self.assertFalse(payload["profit_lock"]["gap_guarantee"])
+
+    def test_profit_lock_exits_when_activation_and_definite_cross_share_candle(self) -> None:
+        config = replace(
+            self.settings,
+            profit_lock_activation_pct=Decimal("4"),
+            minimum_locked_profit_pct=Decimal("2"),
+        )
+        first = 141 * DAY_MS
+        run_paper_cycle(
+            report(
+                first,
+                (entry_decision("AAAUSDT", "100", first - 1),),
+                (bar("AAAUSDT", 140, "100", "101", "99", "100"),),
+            ),
+            config,
+            self.store,
+        )
+        second = 142 * DAY_MS
+        payload = run_paper_cycle(
+            report(
+                second,
+                (no_entry_decision("AAAUSDT", "102", second - 1),),
+                (bar("AAAUSDT", 141, "100", "104.2", "99", "102"),),
+            ),
+            config,
+            self.store,
+        )
+        self.assertEqual(payload["open_positions"], [])
+        exit_event = [item for item in payload["events_today"] if item["event_type"] == "PAPER_EXIT"][0]
+        self.assertEqual(exit_event["payload"]["reason"], "PROTECTIVE_STOP_SAME_CANDLE")
+
+    def test_existing_stop_wins_when_daily_ohlc_order_is_ambiguous(self) -> None:
+        config = replace(
+            self.settings,
+            profit_lock_activation_pct=Decimal("4"),
+            minimum_locked_profit_pct=Decimal("2"),
+        )
+        first = 146 * DAY_MS
+        run_paper_cycle(
+            report(
+                first,
+                (entry_decision("AAAUSDT", "100", first - 1),),
+                (bar("AAAUSDT", 145, "100", "101", "99", "100"),),
+            ),
+            config,
+            self.store,
+        )
+        second = 147 * DAY_MS
+        payload = run_paper_cycle(
+            report(
+                second,
+                (no_entry_decision("AAAUSDT", "102", second - 1),),
+                (bar("AAAUSDT", 146, "100", "104.2", "94", "102"),),
+            ),
+            config,
+            self.store,
+        )
+        exit_event = [item for item in payload["events_today"] if item["event_type"] == "PAPER_EXIT"][0]
+        self.assertEqual(exit_event["payload"]["reason"], "PROTECTIVE_STOP")
+        self.assertLess(Decimal(exit_event["payload"]["realized_pnl_usdt"]), Decimal("0"))
+
     def test_management_only_symbol_is_not_reopened_after_exit(self) -> None:
         first = 151 * DAY_MS
         run_paper_cycle(

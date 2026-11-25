@@ -55,6 +55,31 @@ class HeldSymbolManagementTests(unittest.TestCase):
         self.assertIn("CCCUSDT", {decision.symbol for decision in report.decisions})
         self.assertIn("CCCUSDT", report.session_skipped_symbols)
 
+    def test_probability_tracked_symbol_gets_bar_without_trading_decision(self) -> None:
+        report = observe_market(
+            settings(),
+            client=FakeMarketClient(),
+            now_ms=100 * DAY_MS,
+            tracked_symbols=("CCCUSDT",),
+        )
+        self.assertIn("CCCUSDT", {bar.symbol for bar in report.market_bars})
+        self.assertNotIn("CCCUSDT", {decision.symbol for decision in report.decisions})
+        self.assertNotIn("CCCUSDT", {profile.symbol for profile in report.session_profiles})
+
+    def test_probability_outcome_from_missed_cycle_is_recovered_from_history(self) -> None:
+        outcome_time = 96 * DAY_MS - 1
+        report = observe_market(
+            settings(),
+            client=FakeMarketClient(),
+            now_ms=100 * DAY_MS,
+            tracked_outcomes=(("CCCUSDT", outcome_time),),
+        )
+        self.assertEqual(
+            [(item.symbol, item.close_time) for item in report.probability_bars],
+            [("CCCUSDT", outcome_time)],
+        )
+        self.assertTrue(all(item.close_time == 100 * DAY_MS - 1 for item in report.market_bars))
+
 
 class PublicAnalysisClient:
     def quote_volumes_24h(self):

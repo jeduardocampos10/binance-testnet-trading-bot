@@ -61,6 +61,7 @@ class ObservationReport:
     market_bars: tuple[MarketBar, ...]
     session_profiles: tuple[AssetSessionProfile, ...]
     session_skipped_symbols: tuple[str, ...]
+    probability_bars: tuple[MarketBar, ...] = ()
 
     def as_json_dict(self) -> dict[str, object]:
         return {
@@ -80,6 +81,7 @@ class ObservationReport:
             "market_bars": [bar.as_json_dict() for bar in self.market_bars],
             "session_profiles": [profile.as_json_dict() for profile in self.session_profiles],
             "session_skipped_symbols": list(self.session_skipped_symbols),
+            "probability_bars": [bar.as_json_dict() for bar in self.probability_bars],
         }
 
 
@@ -90,6 +92,8 @@ def observe_market(
     testnet_client: MarketDataClient | None = None,
     now_ms: int | None = None,
     required_symbols: tuple[str, ...] = (),
+    tracked_symbols: tuple[str, ...] = (),
+    tracked_outcomes: tuple[tuple[str, int], ...] = (),
 ) -> ObservationReport:
     market = client if client is not None else MarketDataClient(settings.market_data_source)
     # Tests may intentionally inject one fake for both roles. Production always
@@ -114,8 +118,8 @@ def observe_market(
     ]
     prefiltered.sort(key=lambda item: (volumes[item.symbol], item.symbol), reverse=True)
     prefiltered = prefiltered[: settings.prefilter_n]
-    ranking_symbols = {item.symbol for item in prefiltered}
     requested = set(required_symbols)
+    tracked = ({symbol for symbol, _ in tracked_outcomes} | set(tracked_symbols)) - requested
     analysis_items = list(prefiltered)
 
     snapshots: list[CandidateSnapshot] = []
@@ -159,6 +163,18 @@ def observe_market(
                 f"unable to validate open PAPER position data for {symbol}: {exc}"
             ) from None
         candles_by_symbol[symbol] = candles
+    # Probability-label continuity is best effort. Unlike open-position data,
+    # failure to fetch a tracked candidate must not block exits or the cycle.
+    for symbol in sorted(tracked - set(candles_by_symbol)):
+        try:
+            raw = market.daily_candles(symbol, settings.history_limit)
+            closed = [candle for candle in raw if candle.close_time < timestamp]
+            candles = validate_daily_candles(closed, now_ms=timestamp)
+            if len(candles) < settings.minimum_history:
+                raise DataValidationError("insufficient history")
+        except (MarketDataError, DataValidationError):
+            continue
+        candles_by_symbol[symbol] = candles
     decision_list = [
         evaluate(asset.symbol, candles_by_symbol[asset.symbol], settings)
         if asset.entry_eligible or asset.symbol in requested
@@ -180,6 +196,20 @@ def observe_market(
         if symbol in candles_by_symbol
     )
     decisions = tuple(decision_list)
+    probability_bars_list: list[MarketBar] = []
+    for symbol, outcome_time in sorted(set(tracked_outcomes)):
+        candles = candles_by_symbol.get(symbol, [])
+        outcome = next((item for item in candles if item.close_time == outcome_time), None)
+        if outcome is not None:
+            probability_bars_list.append(MarketBar(
+                symbol=symbol,
+                open_time=outcome.open_time,
+                close_time=outcome.close_time,
+                open=outcome.open,
+                high=outcome.high,
+                low=outcome.low,
+                close=outcome.close,
+            ))
     market_bars = tuple(
         MarketBar(
             symbol=symbol,
@@ -231,4 +261,5 @@ def observe_market(
         market_bars=market_bars,
         session_profiles=tuple(session_profiles),
         session_skipped_symbols=tuple(session_skipped),
+        probability_bars=tuple(probability_bars_list),
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -9,7 +10,16 @@ from zoneinfo import ZoneInfo
 
 from .config import Settings, settings_fingerprint
 from .models import DAY_MS
+from .nexus import build_nexus_review
 from .observer import ObservationReport
+from .probability import (
+    HORIZON_CANDLES,
+    GateEvidence,
+    ProbabilityModelError,
+    evaluate_gate,
+    extract_features,
+    net_outcome,
+)
 from .state import AuditStore
 
 HUNDRED = Decimal("100")
@@ -68,7 +78,7 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
     cycle_close_time = report.market_bars[0].close_time
     day = _day_utc(report.market_bars[0].open_time)
     config_hash = settings_fingerprint(settings)
-    store.ensure_paper_account(_text(settings.paper_equity_usdt), config_hash)
+    store.ensure_paper_account(_text(settings.paper_equity_usdt), config_hash, settings.nexus_mode)
     account = store.paper_account()
     control = store.paper_control()
     if Decimal(account["initial_equity"]) != settings.paper_equity_usdt:
@@ -96,46 +106,19 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
 
         exit_reference: Decimal | None = None
         exit_reason: str | None = None
-        # If the candle opens through a stop, simulate the gap at the open.
+        # A previously active stop is treated as resident for the whole candle.
+        # If its low is crossed, do not use a later/earlier unknown high to claim
+        # a new profit floor: daily OHLC cannot prove the position survived.
+        # An opening gap fills at the open; otherwise it fills at the old stop.
         if bar.low <= active_stop:
             exit_reference = min(active_stop, bar.open)
             exit_reason = "PROTECTIVE_STOP"
-        else:
-            decision = decisions.get(symbol)
-            if decision is not None and decision.signal == "EXIT_CANDIDATE":
-                exit_reference = bar.close
-                exit_reason = "STRATEGY_EXIT"
 
         if exit_reference is not None and exit_reason is not None:
-            fill = _sell_fill(exit_reference, settings)
-            proceeds = quantity * fill
-            fee = proceeds * settings.fee_per_side_pct / HUNDRED
-            cash = Decimal(store.paper_account()["cash"]) + proceeds - fee
-            entry_cost = quantity * entry + Decimal(position["entry_fee"])
-            pnl = proceeds - fee - entry_cost
-            event = _event(
-                key=f"{cycle_close_time}:{symbol}:EXIT:{position['id']}",
-                day=day,
-                timestamp_ms=timestamp,
-                event_type="PAPER_EXIT",
-                symbol=symbol,
-                payload={
-                    "reason": exit_reason,
-                    "reference_price": _text(exit_reference),
-                    "fill_price": _text(fill),
-                    "quantity": _text(quantity),
-                    "fee_usdt": _text(fee),
-                    "realized_pnl_usdt": _text(pnl),
-                },
-            )
-            store.close_paper_position(
-                int(position["id"]),
-                exit_time_ms=timestamp,
-                exit_price=_text(fill),
-                exit_fee=_text(fee),
-                exit_reason=exit_reason,
-                event=event,
-                new_cash=_text(cash),
+            _close_position(
+                store, settings, position, symbol=symbol,
+                exit_reference=exit_reference, exit_reason=exit_reason,
+                cycle_close_time=cycle_close_time, day=day, timestamp=timestamp,
             )
             continue
 
@@ -144,6 +127,37 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
         if peak > entry:
             candidate_trailing = peak * (Decimal("1") - settings.trailing_stop_pct / HUNDRED)
             trailing = max(trailing, candidate_trailing) if trailing is not None else candidate_trailing
+            peak_gain_pct = (peak / entry - Decimal("1")) * HUNDRED
+            if peak_gain_pct >= settings.profit_lock_activation_pct:
+                entry_cost = quantity * entry + Decimal(position["entry_fee"])
+                target_net = entry_cost * (
+                    Decimal("1") + settings.minimum_locked_profit_pct / HUNDRED
+                )
+                sell_cost_factor = (
+                    (Decimal("1") - settings.slippage_per_side_pct / HUNDRED)
+                    * (Decimal("1") - settings.fee_per_side_pct / HUNDRED)
+                )
+                profit_floor_reference = target_net / (quantity * sell_cost_factor)
+                trailing = max(trailing, profit_floor_reference)
+
+        # A high followed by a close below the newly raised stop proves that the
+        # stop was crossed after activation, even though daily OHLC cannot order
+        # an intraday low that later recovered above the stop.
+        if trailing is not None and trailing > active_stop and bar.close <= trailing:
+            _close_position(
+                store, settings, position, symbol=symbol,
+                exit_reference=trailing, exit_reason="PROTECTIVE_STOP_SAME_CANDLE",
+                cycle_close_time=cycle_close_time, day=day, timestamp=timestamp,
+            )
+            continue
+        decision = decisions.get(symbol)
+        if decision is not None and decision.signal == "EXIT_CANDIDATE":
+            _close_position(
+                store, settings, position, symbol=symbol,
+                exit_reference=bar.close, exit_reason="STRATEGY_EXIT",
+                cycle_close_time=cycle_close_time, day=day, timestamp=timestamp,
+            )
+            continue
         store.update_paper_position(
             int(position["id"]),
             peak_price=_text(peak),
@@ -164,7 +178,91 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
     ]
     if any(decision.risk_plan is None for decision in entry_candidates):
         raise ValueError("ENTRY_CANDIDATE without a validated risk plan")
+
+    gate_evidence: dict[str, GateEvidence] = {}
+    if settings.probability_gate_mode != "OFF":
+        # Capture every available bar first, then mature only labels whose fifth
+        # subsequent bar is now present. Candidate features remain prospective.
+        for bar in (*report.market_bars, *report.probability_bars):
+            store.record_probability_bar(bar.symbol, bar.close_time, _text(bar.close))
+        for candidate in store.unlabeled_probability_candidates():
+            outcome_time = int(candidate["candle_close_time"]) + HORIZON_CANDLES * DAY_MS
+            outcome_close = store.probability_bar_close(candidate["symbol"], outcome_time)
+            if outcome_close is not None:
+                label, net_return = net_outcome(
+                    Decimal(candidate["entry_close"]), Decimal(outcome_close), settings
+                )
+                store.label_probability_candidate(
+                    int(candidate["id"]), label=label,
+                    outcome_close_time=outcome_time, net_return=net_return,
+                )
+        for decision in entry_candidates:
+            try:
+                features = extract_features(decision.metrics)
+                store.record_probability_candidate(
+                    symbol=decision.symbol,
+                    candle_close_time=decision.candle_close_time,
+                    strategy_version=settings.strategy_version,
+                    config_hash=config_hash,
+                    entry_close=_text(decision.metrics["close"]),
+                    features=features,
+                )
+                gate_evidence[decision.symbol] = evaluate_gate(features, settings)
+            except (KeyError, ValueError, ProbabilityModelError) as exc:
+                gate_evidence[decision.symbol] = GateEvidence(
+                    "UNAVAILABLE", None, 0, 0, None,
+                    float(settings.probability_threshold),
+                    float(settings.probability_wilson_threshold),
+                    settings.probability_min_support,
+                    False, str(exc), None,
+                )
+    else:
+        for decision in entry_candidates:
+            gate_evidence[decision.symbol] = GateEvidence(
+                "OFF", None, 0, 0, None,
+                float(settings.probability_threshold),
+                float(settings.probability_wilson_threshold),
+                settings.probability_min_support,
+                True, "probability gate disabled", None,
+            )
+
+    selected_probability_candidates: list[str] = []
+    if settings.probability_gate_mode == "REQUIRED":
+        decision_order = {decision.symbol: index for index, decision in enumerate(entry_candidates)}
+        qualified = [decision for decision in entry_candidates if gate_evidence[decision.symbol].allowed]
+        qualified.sort(
+            key=lambda decision: (
+                -(gate_evidence[decision.symbol].probability or 0.0),
+                -(gate_evidence[decision.symbol].wilson_lower_bound or 0.0),
+                -gate_evidence[decision.symbol].support,
+                decision_order[decision.symbol],
+            )
+        )
+        selected_probability_candidates = [
+            decision.symbol for decision in qualified[:settings.probability_max_candidates]
+        ]
+        selected = set(selected_probability_candidates)
+        for decision in qualified[settings.probability_max_candidates:]:
+            gate_evidence[decision.symbol] = replace(
+                gate_evidence[decision.symbol],
+                allowed=False,
+                reason=f"qualified candidate limit of {settings.probability_max_candidates} reached",
+            )
+
     for decision in entry_candidates:
+        evidence = gate_evidence[decision.symbol]
+        if settings.probability_gate_mode == "REQUIRED" and not evidence.allowed:
+            store.record_paper_event(
+                _event(
+                    key=f"{cycle_close_time}:{decision.symbol}:PROBABILITY_BLOCK",
+                    day=day,
+                    timestamp_ms=timestamp,
+                    event_type="ENTRY_BLOCKED_PROBABILITY",
+                    symbol=decision.symbol,
+                    payload={"probability_gate": evidence.as_json_dict(), "reason": evidence.reason},
+                )
+            )
+            continue
         day_state = store.paper_day(day)
         if control["paused"]:
             store.record_paper_event(
@@ -178,6 +276,7 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
                         "reference_price": _text(decision.metrics["close"]),
                         "reason": control["reason"] or "new PAPER entries manually paused",
                         "would_have_entered": True,
+                        "probability_gate": evidence.as_json_dict(),
                     },
                 )
             )
@@ -194,6 +293,7 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
                         "reference_price": _text(decision.metrics["close"]),
                         "reason": day_state["lock_reason"],
                         "would_have_entered": True,
+                        "probability_gate": evidence.as_json_dict(),
                     },
                 )
             )
@@ -209,7 +309,10 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
                     timestamp_ms=timestamp,
                     event_type="ENTRY_BLOCKED_CAPACITY",
                     symbol=decision.symbol,
-                    payload={"max_positions": settings.max_positions},
+                    payload={
+                        "max_positions": settings.max_positions,
+                        "probability_gate": evidence.as_json_dict(),
+                    },
                 )
             )
             continue
@@ -229,6 +332,43 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
         fee = allocation * fee_rate
         new_cash = cash - allocation - fee
         hard_stop = fill * (Decimal("1") - settings.hard_stop_pct / HUNDRED)
+        nexus_permit_id: int | None = None
+        if settings.nexus_mode != "OFF":
+            review = build_nexus_review(
+                decision,
+                evidence,
+                settings,
+                config_hash,
+                paused=bool(control["paused"]),
+                day_locked=bool(day_state["locked"]),
+                open_symbols=tuple(item["symbol"] for item in positions),
+                open_count=len(positions),
+                cash=cash,
+                allocation=allocation + fee,
+                selected_by_probability=(
+                    settings.probability_gate_mode != "REQUIRED"
+                    or decision.symbol in selected_probability_candidates
+                ),
+            )
+            review_id = store.record_nexus_review(review)
+            if settings.nexus_mode == "ENFORCE" and review["disposition"] != "PERMIT_ELIGIBLE":
+                store.record_paper_event(
+                    _event(
+                        key=f"{cycle_close_time}:{decision.symbol}:NEXUS_BLOCK",
+                        day=day,
+                        timestamp_ms=timestamp,
+                        event_type="ENTRY_BLOCKED_NEXUS",
+                        symbol=decision.symbol,
+                        payload={
+                            "review_hash": review["review_hash"],
+                            "disposition": review["disposition"],
+                            "reason_codes": review["reason_codes"],
+                        },
+                    )
+                )
+                continue
+            if settings.nexus_mode == "ENFORCE":
+                nexus_permit_id = store.issue_paper_permit(review_id)
         position = {
             "symbol": decision.symbol,
             "entry_day": day,
@@ -255,9 +395,11 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
                 "gross_usdt": _text(allocation),
                 "fee_usdt": _text(fee),
                 "hard_stop": _text(hard_stop),
+                "nexus_permit_id": nexus_permit_id,
+                "probability_gate": evidence.as_json_dict(),
             },
         )
-        store.open_paper_position(position, event, _text(new_cash))
+        store.open_paper_position(position, event, _text(new_cash), nexus_permit_id)
 
         equity = _equity(store, settings)
         if _loss_pct(equity, start_equity) <= -settings.daily_loss_limit_pct:
@@ -318,6 +460,27 @@ def _run_paper_cycle_locked(report: ObservationReport, settings: Settings, store
         "open_positions": positions_payload,
         "top_20": [asset.symbol for asset in report.ranking],
         "entry_candidates": [item.symbol for item in entry_candidates],
+        "maxx_nexus": (
+            {"mode": "OFF", "status": "OFF", "orders_enabled": False}
+            if settings.nexus_mode == "OFF"
+            else {"mode": settings.nexus_mode, **store.nexus_status(limit=20)}
+        ),
+        "profit_lock": {
+            "activation_pct": _text(settings.profit_lock_activation_pct),
+            "minimum_locked_profit_pct": _text(settings.minimum_locked_profit_pct),
+            "gap_guarantee": False,
+        },
+        "probability_gate": {
+            "mode": settings.probability_gate_mode,
+            "probability_threshold": _text(settings.probability_threshold),
+            "wilson_threshold": _text(settings.probability_wilson_threshold),
+            "minimum_support": settings.probability_min_support,
+            "maximum_candidates": settings.probability_max_candidates,
+            "selected_candidates": selected_probability_candidates,
+            "candidates": {symbol: evidence.as_json_dict() for symbol, evidence in sorted(gate_evidence.items())},
+            "status": store.probability_status() if settings.probability_gate_mode != "OFF" else {"status": "OFF"},
+            "guarantee": False,
+        },
         "exit_candidates": [item.symbol for item in report.decisions if item.signal == "EXIT_CANDIDATE"],
         "favorable_hours": profiles,
         "events_today": events,
@@ -375,6 +538,8 @@ def run_paper_cycle(report: ObservationReport, settings: Settings, store: AuditS
         raise ValueError("PAPER report candle is not the latest closed UTC daily interval")
 
     config_hash = settings_fingerprint(settings)
+    # Operational mode is sticky even when this candle is a cached replay.
+    store.assert_nexus_mode_not_downgraded(settings.nexus_mode)
     cached = store.begin_paper_cycle(
         cycle_close_time, settings.strategy_version, config_hash, report.generated_at_ms
     )
@@ -387,3 +552,71 @@ def run_paper_cycle(report: ObservationReport, settings: Settings, store: AuditS
     except Exception:
         store.abort_paper_cycle()
         raise
+
+
+def _close_position(
+    store: AuditStore,
+    settings: Settings,
+    position: dict[str, Any],
+    *,
+    symbol: str,
+    exit_reference: Decimal,
+    exit_reason: str,
+    cycle_close_time: int,
+    day: str,
+    timestamp: int,
+) -> None:
+    quantity = Decimal(position["quantity"])
+    entry = Decimal(position["entry_price"])
+    fill = _sell_fill(exit_reference, settings)
+    proceeds = quantity * fill
+    fee = proceeds * settings.fee_per_side_pct / HUNDRED
+    cash = Decimal(store.paper_account()["cash"]) + proceeds - fee
+    entry_cost = quantity * entry + Decimal(position["entry_fee"])
+    pnl = proceeds - fee - entry_cost
+    event = _event(
+        key=f"{cycle_close_time}:{symbol}:EXIT:{position['id']}",
+        day=day,
+        timestamp_ms=timestamp,
+        event_type="PAPER_EXIT",
+        symbol=symbol,
+        payload={
+            "reason": exit_reason,
+            "reference_price": _text(exit_reference),
+            "fill_price": _text(fill),
+            "quantity": _text(quantity),
+            "fee_usdt": _text(fee),
+            "realized_pnl_usdt": _text(pnl),
+        },
+    )
+    store.close_paper_position(
+        int(position["id"]),
+        exit_time_ms=timestamp,
+        exit_price=_text(fill),
+        exit_fee=_text(fee),
+        exit_reason=exit_reason,
+        event=event,
+        new_cash=_text(cash),
+    )
+    store.record_post_trade_audit(
+        int(position["id"]),
+        {
+            "schema_version": 1,
+            "status": (
+                "LEGACY_NOT_APPLICABLE"
+                if position["nexus_permit_id"] is None
+                else (
+                    "VERIFIED"
+                    if store.verify_consumed_nexus_permit(
+                        int(position["id"]), int(position["nexus_permit_id"])
+                    )
+                    else "INTEGRITY_ERROR"
+                )
+            ),
+            "symbol": symbol,
+            "nexus_permit_id": position["nexus_permit_id"],
+            "exit_reason": exit_reason,
+            "realized_pnl_usdt": _text(pnl),
+            "orders_enabled": False,
+        },
+    )

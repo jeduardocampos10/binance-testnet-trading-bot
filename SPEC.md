@@ -46,7 +46,8 @@ Percentis reduzem o efeito de valores extremos. Estar no ranking não autoriza e
 - exposição máxima: 10% do patrimônio por posição;
 - até três posições simultâneas na futura primeira versão executora;
 - stop rígido confirmado: 5% abaixo do preço de entrada, e não 5% do patrimônio;
-- trailing stop planejado: 3% abaixo do maior preço observado após alta;
+- trailing stop implementado: 3% abaixo do maior preço observado após alta;
+- profit lock: após ganho máximo de 4%, elevar o stop para proteger pelo menos 0,5% líquido estimado após fee/slippage; gaps podem romper esse piso e não há garantia;
 - duas vezes o ATR14 não pode superar a distância de 5%; moedas mais voláteis são rejeitadas;
 - perda teórica padrão por posição: 0,5% do patrimônio (10% de exposição × stop de 5%), antes de custos;
 - alvo inicial: máximo entre 2R e retorno bruto necessário para a meta líquida após taxa e slippage, sem limitar a continuação via trailing;
@@ -64,6 +65,31 @@ Limites implementados no simulador PAPER e obrigatórios para qualquer executor 
 - stops e saídas protetivas continuam permitidos quando entradas estiverem bloqueadas.
 
 Antes de qualquer executor Testnet ainda será necessário implementar alerta de drawdown de 3%, bloqueio operacional persistente em 5% e desbloqueio manual auditado.
+
+## Gate calibrado de entradas PAPER
+
+- Modos: `OFF` (compatibilidade baseline), `COLLECT` (coleta sem bloqueio) e `REQUIRED` (fail closed para novas entradas). Campos ausentes são `OFF`.
+- Gestão de posições e saídas é executada antes das entradas e nunca é bloqueada por indisponibilidade do modelo.
+- Unidade prospectiva: `ENTRY_CANDIDATE` elegível, persistido idempotentemente antes de modelo, pausa, lock, duplicidade diária ou capacidade.
+- Outcome: `1` somente se compra hipotética no fechamento candidato e venda no fechamento do quinto candle diário subsequente produzirem retorno líquido `> 0` após slippage e fee configurados nas duas pontas; caso contrário `0`.
+- A barra futura serve apenas para maturar o label. Features são a fotografia do candle candidato e não podem ser recalculadas com dados futuros.
+- Split global por tempo, nunca aleatório nem por símbolo: treino 60%, calibração 20%, teste 20%, com embargo do horizonte antes de calibração e teste.
+- Modelo stdlib determinístico: regressão logística padronizada e calibração isotônica PAVA. Valores ausentes, não finitos, artefato divergente ou hash inválido falham fechados.
+- Mínimos de fit: 300 labels totais; 180 treino, 60 calibração e 60 teste após embargo; pelo menos 20 de cada classe por partição; Brier estritamente melhor que baseline e ECE <= 0,10.
+- Artefato JSON canônico com SHA-256, versão da estratégia, hash da configuração material, definição do outcome e nomes/ordem das features. Pickle é proibido. SHA-256 fornece integridade de conteúdo, não autenticidade de origem.
+- Em `REQUIRED`, a probabilidade calibrada deve alcançar 0,65, o limite inferior de Wilson 0,55 e o bloco isotônico suporte 50. No máximo cinco candidatos qualificados seguem por ciclo, ainda limitados a três posições. Eventos de bloqueio/entrada e relatório registram status, probabilidade, suporte, Wilson, hash e motivo.
+- Nenhuma métrica oferece garantia. O modelo exige candidatos prospectivos; candles históricos sem decisões observadas não substituem a coleta.
+- Fit e status são comandos locais one-shot. Não existe scheduler nem executor/ordem Binance.
+
+## Maxx Nexus — mesa e estratégia
+
+- Modos: `OFF`, `AUDIT` e `ENFORCE`; ausente significa `OFF`. Promoções são persistidas; downgrade no mesmo banco falha fechado e exige banco novo.
+- `AUDIT` registra pareceres, decisão do Conselho e gates em sombra sem mudar o baseline.
+- `ENFORCE` falha fechado e só permitiria entrada PAPER com todos os gates aprovados e permit de uso único consumido atomicamente com a posição.
+- Ordem obrigatória: saídas existentes → dados/probabilidade → Conselho → Compliance → Risco → Capital → Mesa → entrada PAPER → auditoria pós-operação.
+- Técnico e Quant usam evidências locais. Fundamentalista, On-chain, Macro, Notícias, Mercado e Pesquisa permanecem `NOT_CONFIGURED` até fonte explícita; ausência nunca é sinal positivo.
+- Risk Manager/Analista de Risco, Gestor de Capital, Compliance, Head/Senior/Junior Trader e Auditor Financeiro têm responsabilidades formalizadas. Scalper permanece desabilitado.
+- Não há override, ordem, scheduler, credencial Binance ou execução Testnet nesta fase.
 
 ## Estados planejados
 

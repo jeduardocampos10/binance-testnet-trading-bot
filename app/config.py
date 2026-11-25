@@ -46,6 +46,15 @@ class Settings:
     hourly_history_limit: int
     minimum_hour_samples: int
     report_timezone: str
+    probability_gate_mode: str = "OFF"
+    probability_threshold: Decimal = Decimal("0.65")
+    probability_wilson_threshold: Decimal = Decimal("0.55")
+    probability_min_support: int = 50
+    probability_max_candidates: int = 5
+    probability_model_path: str | None = None
+    profit_lock_activation_pct: Decimal = Decimal("4")
+    minimum_locked_profit_pct: Decimal = Decimal("0.5")
+    nexus_mode: str = "OFF"
 
 
 def _decimal(payload: dict[str, object], key: str) -> Decimal:
@@ -145,6 +154,31 @@ def load_settings(path: str | Path) -> Settings:
         hourly_history_limit=hourly_history_limit,
         minimum_hour_samples=minimum_hour_samples,
         report_timezone=report_timezone,
+        probability_gate_mode=str(payload.get("probability_gate_mode", "OFF")),
+        probability_threshold=(
+            _decimal(payload, "probability_threshold")
+            if "probability_threshold" in payload else Decimal("0.65")
+        ),
+        probability_wilson_threshold=(
+            _decimal(payload, "probability_wilson_threshold")
+            if "probability_wilson_threshold" in payload else Decimal("0.55")
+        ),
+        probability_min_support=payload.get("probability_min_support", 50),
+        probability_max_candidates=payload.get("probability_max_candidates", 5),
+        probability_model_path=(
+            str(payload["probability_model_path"])
+            if isinstance(payload.get("probability_model_path"), str) and payload["probability_model_path"]
+            else None
+        ),
+        profit_lock_activation_pct=(
+            _decimal(payload, "profit_lock_activation_pct")
+            if "profit_lock_activation_pct" in payload else Decimal("4")
+        ),
+        minimum_locked_profit_pct=(
+            _decimal(payload, "minimum_locked_profit_pct")
+            if "minimum_locked_profit_pct" in payload else Decimal("0.5")
+        ),
+        nexus_mode=str(payload.get("nexus_mode", "OFF")),
     )
     if settings.paper_equity_usdt <= 0:
         raise ConfigurationError("paper_equity_usdt must be positive")
@@ -168,14 +202,52 @@ def load_settings(path: str | Path) -> Settings:
         raise ConfigurationError("invalid minimum_volume_ratio")
     if not Decimal("0") < settings.maximum_spread_pct <= Decimal("2"):
         raise ConfigurationError("maximum_spread_pct must be in (0, 2]")
+    if settings.probability_gate_mode not in {"OFF", "COLLECT", "REQUIRED"}:
+        raise ConfigurationError("probability_gate_mode must be OFF, COLLECT, or REQUIRED")
+    if not Decimal("0") < settings.probability_threshold < Decimal("1"):
+        raise ConfigurationError("probability_threshold must be in (0, 1)")
+    if not Decimal("0") < settings.probability_wilson_threshold < Decimal("1"):
+        raise ConfigurationError("probability_wilson_threshold must be in (0, 1)")
+    if (
+        not isinstance(settings.probability_min_support, int)
+        or isinstance(settings.probability_min_support, bool)
+        or not 1 <= settings.probability_min_support <= 10000
+    ):
+        raise ConfigurationError("probability_min_support must be an integer between 1 and 10000")
+    if (
+        not isinstance(settings.probability_max_candidates, int)
+        or isinstance(settings.probability_max_candidates, bool)
+        or not 1 <= settings.probability_max_candidates <= 5
+    ):
+        raise ConfigurationError("probability_max_candidates must be an integer between 1 and 5")
+    if "probability_model_path" in payload and settings.probability_model_path is None:
+        raise ConfigurationError("probability_model_path must be a non-empty string")
+    if not Decimal("0") < settings.profit_lock_activation_pct <= Decimal("100"):
+        raise ConfigurationError("profit_lock_activation_pct must be in (0, 100]")
+    if not Decimal("0") <= settings.minimum_locked_profit_pct < settings.profit_lock_activation_pct:
+        raise ConfigurationError("minimum_locked_profit_pct must be non-negative and below activation")
+    if settings.nexus_mode not in {"OFF", "AUDIT", "ENFORCE"}:
+        raise ConfigurationError("nexus_mode must be OFF, AUDIT, or ENFORCE")
     return settings
 
 
 def settings_fingerprint(settings: Settings) -> str:
     """Return a stable hash for all strategy, risk, cost, and report settings."""
+    # Gate operation/path are deliberately excluded: old databases keep their
+    # existing fingerprint, and COLLECT can safely transition to REQUIRED while
+    # the artifact remains bound to the underlying strategy/cost configuration.
     payload = {
         key: format(value, "f") if isinstance(value, Decimal) else value
         for key, value in asdict(settings).items()
+        if key not in {
+            "probability_gate_mode",
+            "probability_threshold",
+            "probability_wilson_threshold",
+            "probability_min_support",
+            "probability_max_candidates",
+            "probability_model_path",
+            "nexus_mode",
+        }
     }
     payload["effective_mandatory_excluded_base_assets"] = sorted(
         EFFECTIVE_MANDATORY_EXCLUDED_BASE_ASSETS

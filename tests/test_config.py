@@ -52,6 +52,21 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result.quote_asset, "USDT")
         self.assertEqual(str(result.paper_equity_usdt), "100")
         self.assertEqual(result.max_positions, 3)
+        self.assertEqual(result.nexus_mode, "OFF")
+        self.assertEqual(str(result.profit_lock_activation_pct), "4")
+        self.assertEqual(str(result.minimum_locked_profit_pct), "0.5")
+
+    def test_rejects_invalid_nexus_mode_and_profit_floor(self) -> None:
+        invalid_mode = dict(VALID, nexus_mode="LIVE")
+        with self.assertRaises(ConfigurationError):
+            load_settings(self._write(invalid_mode))
+        invalid_floor = dict(
+            VALID,
+            profit_lock_activation_pct="4",
+            minimum_locked_profit_pct="4",
+        )
+        with self.assertRaises(ConfigurationError):
+            load_settings(self._write(invalid_floor))
 
     def test_rejects_non_allowlisted_quote_asset(self) -> None:
         payload = dict(VALID)

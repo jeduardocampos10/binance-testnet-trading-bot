@@ -16,7 +16,19 @@ def run_analysis_cycle(config_path: str | Path, db_path: str | Path, *, paper: b
     store = AuditStore(db_path)
     try:
         required_symbols = store.open_symbols() if paper else ()
-        report = observe_market(settings, required_symbols=required_symbols)
+        tracked_probability_outcomes = (
+            store.pending_probability_outcomes()
+            if paper and settings.probability_gate_mode != "OFF" else ()
+        )
+        tracked_probability_symbols = tuple(
+            sorted({symbol for symbol, _ in tracked_probability_outcomes})
+        )
+        report = observe_market(
+            settings,
+            required_symbols=required_symbols,
+            tracked_symbols=tracked_probability_symbols,
+            tracked_outcomes=tracked_probability_outcomes,
+        )
         for decision in report.decisions:
             store.record(decision)
         inserted = store.record_report(report)

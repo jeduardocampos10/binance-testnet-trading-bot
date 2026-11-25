@@ -13,6 +13,8 @@
   "max_exposure_pct": "10",
   "hard_stop_pct": "5",
   "trailing_stop_pct": "3",
+  "profit_lock_activation_pct": "4",
+  "minimum_locked_profit_pct": "0.5",
   "daily_loss_limit_pct": "3",
   "reward_risk_ratio": "2",
   "daily_goal_pct": "1",
@@ -24,5 +26,11 @@
   "maximum_spread_pct": "0.5",
   "hourly_history_limit": 1000,
   "minimum_hour_samples": 20,
-  "report_timezone": "America/Sao_Paulo"
+  "report_timezone": "America/Sao_Paulo",
+  "probability_gate_mode": "OFF",
+  "probability_threshold": "0.65",
+  "probability_wilson_threshold": "0.55",
+  "probability_min_support": 50,
+  "probability_max_candidates": 5,
+  "nexus_mode": "OFF"
 }
