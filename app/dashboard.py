@@ -7,7 +7,6 @@ import base64
 import hashlib
 import hmac
 import json
-import secrets
 import sqlite3
 import threading
 import time
@@ -21,13 +20,20 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .analytics import build_analytics
+from .bridge_client import BridgeBalanceClient, BridgeUnavailable, read_bridge_token
 from .config import load_settings
 from .manual_analysis import run_manual_analysis
 from .openai_advisor import OpenAIAdvisor
+from .read_store import DashboardReadStore
 from .service import run_analysis_cycle
 from .state import AuditStore
 
 MAX_BODY_BYTES = 4096
+STATIC_ROOT = Path(__file__).resolve().parent / "static"
+STATIC_ASSETS = {
+    "/assets/app.css": (STATIC_ROOT / "app.css", "text/css; charset=utf-8"),
+    "/assets/app.js": (STATIC_ROOT / "app.js", "text/javascript; charset=utf-8"),
+}
 
 
 def _json_safe(value: Any) -> Any:
@@ -55,7 +61,8 @@ class DashboardApplication:
     def __init__(self, config_path: Path, db_path: Path, token: str, *,
                  openai_api_key_file: Path | None = None,
                  openai_model_file: Path | None = None,
-                 advisor: OpenAIAdvisor | None = None) -> None:
+                 advisor: OpenAIAdvisor | None = None,
+                 bridge_client: BridgeBalanceClient | None = None) -> None:
         self.config_path = config_path.resolve()
         self.db_path = db_path.resolve()
         self.token = token
@@ -64,12 +71,16 @@ class DashboardApplication:
         self.advisor = advisor
         if self.advisor is None and openai_api_key_file is not None and openai_model_file is not None:
             self.advisor = OpenAIAdvisor.from_files(openai_api_key_file, openai_model_file)
+        self.bridge_client = bridge_client
         self.csrf_token = hmac.new(token.encode(), b"paper-dashboard-csrf-v1", hashlib.sha256).hexdigest()
         self._action_lock = threading.Lock()
         self._job_lock = threading.Lock()
         self._job: dict[str, Any] = {"running": False, "action": None, "result": None, "error": None}
         load_settings(self.config_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Complete schema initialization before concurrent read-only dashboard requests begin.
+        bootstrap_store = AuditStore(self.db_path)
+        bootstrap_store.close()
 
     def authorized(self, header: str | None) -> bool:
         if not header or not header.startswith("Basic "):
@@ -188,6 +199,61 @@ class DashboardApplication:
         finally:
             store.close()
 
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "schema_version": "dashboard.capabilities.v1",
+            "execution_mode": "PAPER",
+            "paper_only": True,
+            "production_enabled": False,
+            "orders_enabled": False,
+            "testnet_orders_enabled": False,
+            "bridge": {
+                "enabled": self.bridge_client is not None,
+                "read_only": True,
+                "capabilities": ["balance"] if self.bridge_client is not None else [],
+            },
+        }
+
+    def paper_orders(self, *, limit: int, before_id: int | None) -> dict[str, Any]:
+        with DashboardReadStore(self.db_path) as store:
+            return store.orders(limit=limit, before_id=before_id)
+
+    def paper_positions(self, *, status: str) -> dict[str, Any]:
+        settings = load_settings(self.config_path)
+        with DashboardReadStore(self.db_path) as store:
+            return store.positions(status=status, fee_per_side_pct=settings.fee_per_side_pct)
+
+    def paper_events(
+        self,
+        *,
+        limit: int,
+        before_id: int | None,
+        symbol: str | None,
+        event_type: str | None,
+    ) -> dict[str, Any]:
+        with DashboardReadStore(self.db_path) as store:
+            return store.events(
+                limit=limit,
+                before_id=before_id,
+                symbol=self.validate_symbol(symbol) if symbol else None,
+                event_type=event_type,
+            )
+
+    def paper_risk(self) -> dict[str, Any]:
+        settings = load_settings(self.config_path)
+        with DashboardReadStore(self.db_path) as store:
+            return store.risk(
+                max_positions=settings.max_positions,
+                max_exposure_pct=settings.max_exposure_pct,
+                daily_loss_limit_pct=settings.daily_loss_limit_pct,
+                fee_per_side_pct=settings.fee_per_side_pct,
+            )
+
+    def testnet_balance(self) -> dict[str, Any]:
+        if self.bridge_client is None:
+            raise BridgeUnavailable("Binance Testnet Bridge is not configured")
+        return self.bridge_client.balance()
+
     def setup(self) -> dict[str, Any]:
         settings = load_settings(self.config_path)
         store = AuditStore(self.db_path)
@@ -201,6 +267,8 @@ class DashboardApplication:
             "allowed_actions": ["observe", "paper", "manual_analysis", "pause", "resume", "export"],
             "forbidden_actions": ["shell", "testnet_order", "production_order", "orders", "config_mutation_with_active_db"],
             "orders_enabled": False,
+            "bridge_enabled": self.bridge_client is not None,
+            "bridge_read_only": True,
             "llm_enabled": self.advisor is not None,
             "model": self.advisor.model if self.advisor is not None else None,
         }
@@ -218,7 +286,7 @@ class DashboardApplication:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "PaperDashboard/0.5"
+    server_version = "PaperDashboard/0.6"
     sys_version = ""
 
     def setup(self) -> None:
@@ -235,14 +303,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(f"dashboard {self.client_address[0]} {format % args}")
 
-    def _security_headers(self, nonce: str | None = None) -> None:
+    def _security_headers(self, *, interactive: bool = False) -> None:
         self.send_header("Cache-Control", "no-store")
-        if nonce:
+        if interactive:
             policy = (
-                "default-src 'none'; "
-                f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
-                "base-uri 'none'; form-action 'self'"
+                "base-uri 'none'; form-action 'self'; object-src 'none'"
             )
         else:
             policy = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
@@ -273,16 +340,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _send_html(self) -> None:
-        nonce = secrets.token_urlsafe(18)
-        raw = (
-            DASHBOARD_HTML.replace("__CSRF__", self.app.csrf_token)
-            .replace("__NONCE__", nonce)
-            .encode("utf-8")
-        )
+        template = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+        raw = template.replace("__CSRF__", self.app.csrf_token).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
-        self._security_headers(nonce)
+        self._security_headers(interactive=True)
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_asset(self, path: str) -> None:
+        asset, content_type = STATIC_ASSETS[path]
+        raw = asset.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self._security_headers(interactive=True)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -301,38 +374,87 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("JSON body must be an object")
         return payload
 
+    @staticmethod
+    def _query(path_query: str, allowed: set[str]) -> dict[str, str]:
+        parsed = parse_qs(path_query, keep_blank_values=True)
+        if set(parsed) - allowed or any(len(values) != 1 for values in parsed.values()):
+            raise ValueError("invalid query parameters")
+        return {key: values[0] for key, values in parsed.items()}
+
+    @staticmethod
+    def _positive_int(value: str | None, default: int) -> int:
+        if value is None:
+            return default
+        if not value.isascii() or not value.isdigit():
+            raise ValueError("invalid numeric query parameter")
+        result = int(value)
+        if result < 1:
+            raise ValueError("invalid numeric query parameter")
+        return result
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path)
         if path.path == "/health":
-            self._send_json({"status": "ok", "mode": "PAPER", "orders_enabled": False,
-                             "llm_enabled": self.app.advisor is not None,
-                             "model": self.app.advisor.model if self.app.advisor is not None else None})
+            self._send_json({"status": "ok"})
             return
         if not self._authenticate():
             return
         try:
             if path.path in {"/", "/setup"}:
                 self._send_html()
+            elif path.path in STATIC_ASSETS and not path.query:
+                self._send_asset(path.path)
             elif path.path == "/api/status":
                 self._send_json(self.app.status())
             elif path.path == "/api/analytics":
-                period = parse_qs(path.query).get("period", ["month"])[0]
-                self._send_json(self.app.analytics(period))
+                query = self._query(path.query, {"period"})
+                self._send_json(self.app.analytics(query.get("period", "month")))
             elif path.path == "/api/setup":
                 self._send_json(self.app.setup())
+            elif path.path == "/api/v1/capabilities":
+                self._send_json(self.app.capabilities())
+            elif path.path == "/api/v1/paper/orders":
+                query = self._query(path.query, {"limit", "before_id"})
+                self._send_json(self.app.paper_orders(
+                    limit=self._positive_int(query.get("limit"), 100),
+                    before_id=self._positive_int(query.get("before_id"), 1) if query.get("before_id") else None,
+                ))
+            elif path.path == "/api/v1/paper/positions":
+                query = self._query(path.query, {"status"})
+                self._send_json(self.app.paper_positions(status=query.get("status", "open")))
+            elif path.path == "/api/v1/paper/risk":
+                self._query(path.query, set())
+                self._send_json(self.app.paper_risk())
+            elif path.path == "/api/v1/paper/events":
+                query = self._query(path.query, {"limit", "before_id", "symbol", "type"})
+                event_type = query.get("type")
+                if event_type and not re.fullmatch(r"[A-Z0-9_]{2,64}", event_type):
+                    raise ValueError("invalid event type")
+                self._send_json(self.app.paper_events(
+                    limit=self._positive_int(query.get("limit"), 100),
+                    before_id=self._positive_int(query.get("before_id"), 1) if query.get("before_id") else None,
+                    symbol=query.get("symbol") or None,
+                    event_type=event_type,
+                ))
+            elif path.path == "/api/v1/testnet/balance":
+                self._query(path.query, set())
+                self._send_json(self.app.testnet_balance())
             elif path.path == "/api/manual/top10":
                 self._send_json(self.app.manual_top10())
             elif path.path == "/api/manual/latest":
-                symbol = parse_qs(path.query).get("symbol", [""])[0]
+                symbol = self._query(path.query, {"symbol"}).get("symbol", "")
                 self._send_json(self.app.manual_latest(symbol) or {"status": "not_found"})
             elif path.path == "/api/manual/history":
-                symbol = parse_qs(path.query).get("symbol", [""])[0]
+                symbol = self._query(path.query, {"symbol"}).get("symbol", "")
                 self._send_json({"analyses": self.app.manual_history(symbol)})
             elif path.path == "/api/export":
-                kind = parse_qs(path.query).get("kind", ["paper"])[0]
+                kind = self._query(path.query, {"kind"}).get("kind", "paper")
                 self._send_json(self.app.export(kind), attachment=f"{kind}-report.json")
             else:
                 self._send_json({"error": "not found"}, 404)
+        except BridgeUnavailable as exc:
+            self._send_json({"error": str(exc)[:200], "bridge_status": "unavailable",
+                             "paper_available": True, "orders_enabled": False}, 503)
         except sqlite3.Error:
             self._send_json({"error": "database temporarily unavailable"}, 503)
         except (ValueError, OSError) as exc:
@@ -407,6 +529,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--auth-token-file", required=True)
     parser.add_argument("--openai-api-key-file")
     parser.add_argument("--openai-model-file")
+    parser.add_argument("--bridge-url")
+    parser.add_argument("--bridge-auth-token-file")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     return parser
@@ -419,13 +543,25 @@ def main(argv: list[str] | None = None) -> int:
     token = _read_token(Path(args.auth_token_file))
     if bool(args.openai_api_key_file) != bool(args.openai_model_file):
         raise SystemExit("OpenAI API key and model files must be provided together")
+    if bool(args.bridge_url) != bool(args.bridge_auth_token_file):
+        raise SystemExit("Bridge URL and token file must be provided together")
+    bridge_client = None
+    if args.bridge_url and args.bridge_auth_token_file:
+        bridge_client = BridgeBalanceClient(
+            args.bridge_url,
+            read_bridge_token(Path(args.bridge_auth_token_file)),
+        )
     app = DashboardApplication(
         Path(args.config), Path(args.db), token,
         openai_api_key_file=Path(args.openai_api_key_file) if args.openai_api_key_file else None,
         openai_model_file=Path(args.openai_model_file) if args.openai_model_file else None,
+        bridge_client=bridge_client,
     )
     server = DashboardServer((args.host, args.port), app)
-    print(f"PAPER dashboard listening on {args.host}:{args.port}; orders_enabled=false")
+    print(
+        f"PAPER dashboard listening on {args.host}:{args.port}; orders_enabled=false; "
+        f"bridge_read_only={str(bridge_client is not None).lower()}"
+    )
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

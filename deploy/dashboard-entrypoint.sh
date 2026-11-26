@@ -24,4 +24,11 @@ if [ -f /run/secrets/openai_api_key ] || [ -f /run/secrets/openai_model ]; then
         --openai-model-file /run/secrets/openai_model
 fi
 
+# The Bridge is optional and strictly read-only. Its token is mounted only here and in the Bridge.
+if [ -f /run/secrets/bridge_auth_token ]; then
+    set -- "$@" \
+        --bridge-url http://binance-testnet-bridge:8080 \
+        --bridge-auth-token-file /run/secrets/bridge_auth_token
+fi
+
 exec python -m app.dashboard "$@"

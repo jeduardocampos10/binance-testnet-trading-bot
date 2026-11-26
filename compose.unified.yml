@@ -1,0 +1,74 @@
+services:
+  paper-dashboard:
+    image: ${PAPER_DASHBOARD_IMAGE:?set an immutable digest-pinned dashboard image}
+    restart: unless-stopped
+    expose:
+      - "8080"
+    volumes:
+      - dashboard_data:/data
+      - ${OPENAI_API_KEY_FILE:-/dev/null}:/run/secrets/openai_api_key:ro
+      - ${OPENAI_MODEL_FILE:-/dev/null}:/run/secrets/openai_model:ro
+    secrets:
+      - dashboard_auth_token
+      - bridge_auth_token
+    networks:
+      - proxy
+      - bridge_private
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+
+  binance-testnet-bridge:
+    image: ${BINANCE_TESTNET_BRIDGE_IMAGE:?set an immutable digest-pinned Bridge image}
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      BINANCE_TESTNET_API_KEY_FILE: /run/secrets/binance_testnet_api_key
+      BINANCE_TESTNET_SECRET_KEY_FILE: /run/secrets/binance_testnet_secret_key
+      BRIDGE_AUTH_TOKEN_FILE: /run/secrets/bridge_auth_token
+    secrets:
+      - binance_testnet_api_key
+      - binance_testnet_secret_key
+      - bridge_auth_token
+    networks:
+      - bridge_private
+      - bridge_egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+
+volumes:
+  dashboard_data:
+
+networks:
+  proxy:
+    external: true
+    name: ${DASHBOARD_PROXY_NETWORK:?set the exact non-production proxy network name}
+  bridge_private:
+    internal: true
+  bridge_egress: {}
+
+secrets:
+  dashboard_auth_token:
+    file: ./secrets/dashboard_auth_token
+  bridge_auth_token:
+    file: ./secrets/bridge_auth_token
+  binance_testnet_api_key:
+    file: ./secrets/binance_testnet_api_key
+  binance_testnet_secret_key:
+    file: ./secrets/binance_testnet_secret_key

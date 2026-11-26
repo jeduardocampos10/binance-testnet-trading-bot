@@ -8,9 +8,12 @@ O dashboard mostra resultados e executa somente ações predefinidas. Ele não o
 - patrimônio, retorno, P&L realizado/não realizado e drawdown;
 - melhores e piores ativos, trades, vitórias, perdas e taxa de acerto;
 - curva de patrimônio e resultados diários;
+- tela moderna e responsiva para ordens PAPER, posições, risco, eventos e controles;
+- ordens sempre identificadas como `FILLED_SIMULATED` e “não enviada à Binance”;
+- saldo da Binance Spot Testnet via Bridge privado somente leitura, separado da contabilidade PAPER;
 - posições, stops, Top 20, tendências, sinais, horários favoráveis e rejeições;
 - configuração validada em modo somente leitura;
-- ações autenticadas: `OBSERVATION`, `PAPER`, pausar entradas, retomar entradas e exportar JSON.
+- ações autenticadas: `OBSERVATION`, `PAPER`, análise manual, pausar entradas, retomar entradas e exportar JSON.
 
 Alterar risco, estratégia ou universo exige nova configuração, versão e banco. Isso não pode ser feito pelo navegador enquanto um banco está ativo.
 
@@ -24,7 +27,10 @@ Alterar risco, estratégia ou universo exige nova configuração, versão e banc
 - SQLite também serializa ciclos concorrentes;
 - processo sem root (UID/GID 1000);
 - somente endpoints públicos GET allowlisted;
-- `orders_enabled=false` em saúde, APIs e relatórios;
+- `/health` público expõe somente `status`; capacidades e APIs autenticadas mantêm `orders_enabled=false`;
+- navegador nunca recebe o token do Bridge nem credenciais Binance;
+- cliente do Bridge aceita apenas o hostname privado fixo/loopback, ignora proxies, rejeita redirects, limita resposta e falha fechado;
+- indisponibilidade do Bridge degrada somente a tela de saldo; PAPER continua disponível;
 - publique apenas por HTTPS no proxy do Coolify.
 
 ## Teste local dentro do container atual
@@ -103,4 +109,58 @@ python -m app.dashboard --config /data/config.json --db /data/paper.sqlite3 \
   --openai-model-file /run/secrets/openai_model
 ```
 
-A UI e `/health` mostram apenas `llm_enabled` e o model ID, nunca a chave.
+A UI e as APIs autenticadas podem mostrar somente `llm_enabled` e o model ID, nunca a chave. O `/health` público retorna apenas `status`.
+
+## Arquitetura unificada: PAPER + Bridge + Testnet
+
+```text
+Navegador autenticado
+        |
+        v
+Dashboard / BFF (porta 8080, HTTPS no proxy)
+  |-- SQLite PAPER em /data (ordens simuladas, posições, risco e eventos)
+  `-- GET /balance + Bearer interno
+             |
+             v
+     Binance Testnet Bridge (privado, sem porta pública)
+             |
+             `-- GET /api/v3/account na Binance Spot Testnet
+```
+
+A interface é única, mas as fronteiras permanecem explícitas:
+
+- **PAPER:** simulação local; nenhuma ordem é enviada;
+- **Testnet:** somente saldo consultado pelo Bridge;
+- **produção:** desabilitada;
+- **credenciais Binance:** existem exclusivamente no Bridge;
+- **token interno:** compartilhado apenas entre dashboard e Bridge.
+
+Novos endpoints autenticados e somente leitura:
+
+- `GET /api/v1/capabilities`;
+- `GET /api/v1/paper/orders`;
+- `GET /api/v1/paper/positions`;
+- `GET /api/v1/paper/risk`;
+- `GET /api/v1/paper/events`;
+- `GET /api/v1/testnet/balance`.
+
+Não existe endpoint de ordem Binance ou Testnet. Uma futura execução Testnet exigirá um executor privado separado, revisão de segurança e autorização específica; não deve ser acrescentada ao Bridge de leitura.
+
+## Compose unificado
+
+`compose.unified.yml` conecta os dois serviços por uma rede interna dedicada. O Bridge também recebe uma rede de egress; **o Docker Compose, sozinho, não limita essa saída por hostname**. Uma allowlist externa de firewall/proxy deve restringi-la a `testnet.binance.vision:443` antes de qualquer deploy. O Bridge não possui `ports`, domínio, volume de dados ou acesso ao banco PAPER.
+
+Antes de qualquer implantação autorizada:
+
+1. revisar os testes e os códigos-fonte do dashboard e do projeto dedicado `binance-testnet-bridge`, publicando duas imagens próprias com proveniência e fixadas por digest;
+2. definir `PAPER_DASHBOARD_IMAGE` e `BINANCE_TESTNET_BRIDGE_IMAGE` com referências `repository@sha256:...` distintas;
+3. definir `DASHBOARD_PROXY_NETWORK` com a rede exata do proxy no ambiente não produtivo;
+4. disponibilizar os quatro arquivos em `secrets/` (todos ignorados pelo Git): `dashboard_auth_token`, `bridge_auth_token`, `binance_testnet_api_key` e `binance_testnet_secret_key`;
+5. executar `deploy/preflight-unified.py --secrets-dir ./secrets` sem expor valores;
+6. confirmar que `bridge_auth_token` é o mesmo arquivo montado no dashboard e Bridge, sem reutilizar credencial Binance;
+7. confirmar no host que somente o Bridge recebe as duas credenciais Binance;
+8. aplicar e validar egress deny-by-default com allowlist para a Spot Testnet; o nome `bridge_egress` não é um controle de saída;
+9. validar `/health`, depois `/api/v1/capabilities` e por fim uma única consulta autorizada a `/api/v1/testnet/balance`;
+10. manter `orders_enabled=false` e não ativar agendamento.
+
+O Compose é um artefato de implantação; sua existência não autoriza build, deploy, restart ou consulta autenticada à Binance.

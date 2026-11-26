@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="csrf-token" content="__CSRF__">
+  <title>Cashmaxx · PAPER Command Center</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Ir para o conteúdo</a>
+  <div class="app-shell">
+    <aside id="primaryNavigation" class="sidebar" aria-label="Navegação principal">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">M</div>
+        <div><strong>MAXX</strong><span>Command Center</span></div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-view="overview"><span aria-hidden="true">⌂</span>Visão geral</button>
+        <button class="nav-item" data-view="orders"><span aria-hidden="true">⇄</span>Ordens PAPER</button>
+        <button class="nav-item" data-view="positions"><span aria-hidden="true">◎</span>Posições</button>
+        <button class="nav-item" data-view="risk"><span aria-hidden="true">◇</span>Risco</button>
+        <button class="nav-item" data-view="testnet"><span aria-hidden="true">◫</span>Saldo Testnet</button>
+        <button class="nav-item" data-view="events"><span aria-hidden="true">≡</span>Eventos</button>
+        <button class="nav-item" data-view="analysis"><span aria-hidden="true">✦</span>Análise</button>
+        <button class="nav-item" data-view="controls"><span aria-hidden="true">⚙</span>Controles</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="status-dot" id="systemDot"></span>
+        <div><strong id="systemState">Carregando</strong><span id="systemDetail">Verificando capacidades</span></div>
+      </div>
+    </aside>
+
+    <main id="workspace" class="workspace">
+      <header class="topbar">
+        <button id="menuToggle" class="icon-button menu-toggle" aria-label="Abrir navegação" aria-controls="primaryNavigation" aria-expanded="false">☰</button>
+        <div>
+          <p class="eyebrow">BINANCE SPOT TESTNET · OPERAÇÃO SEGURA</p>
+          <h1 id="pageTitle">Visão geral</h1>
+        </div>
+        <div class="top-actions">
+          <span class="mode-chip"><span></span>PAPER ONLY</span>
+          <button class="icon-button" id="refreshAll" aria-label="Atualizar dados" title="Atualizar dados">↻</button>
+        </div>
+      </header>
+
+      <div class="safety-banner" role="status">
+        <div class="shield" aria-hidden="true">✓</div>
+        <div><strong>Simulação protegida</strong><span>Ordens são locais e nunca são enviadas à Binance. O Bridge acessa apenas saldo da Spot Testnet.</span></div>
+        <span class="banner-badge">ORDERS_ENABLED = FALSE</span>
+      </div>
+
+      <div id="globalError" class="alert error hidden" role="alert"></div>
+
+      <section id="overview" class="view active" aria-labelledby="overview-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">CONTA SIMULADA</p><h2 id="overview-title">Pulso da estratégia</h2></div>
+          <div class="segmented" aria-label="Período">
+            <button data-period="day">1D</button><button data-period="week">7D</button><button data-period="month" class="active">30D</button><button data-period="all">Tudo</button>
+          </div>
+        </div>
+        <div class="metric-grid">
+          <article class="metric-card hero-metric"><span>Patrimônio PAPER</span><strong id="equity">—</strong><small id="equityChange">Conta simulada</small></article>
+          <article class="metric-card"><span>P&L do período</span><strong id="pnl">—</strong><small id="returnPct">—</small></article>
+          <article class="metric-card"><span>Exposição aberta</span><strong id="exposure">—</strong><small id="positionCapacity">—</small></article>
+          <article class="metric-card"><span>Drawdown máximo</span><strong id="drawdown">—</strong><small>Limite observado</small></article>
+        </div>
+        <div class="content-grid">
+          <article class="panel span-8">
+            <div class="panel-head"><div><span class="panel-kicker">DESEMPENHO</span><h3>Curva de patrimônio</h3></div><span id="chartRange" class="subtle">Últimos 30 dias</span></div>
+            <canvas id="equityChart" width="960" height="320" aria-label="Curva de patrimônio PAPER" aria-describedby="chartSummary"></canvas>
+            <p id="chartSummary" class="subtle" role="status">Aguardando série de patrimônio PAPER.</p>
+          </article>
+          <article class="panel span-4">
+            <div class="panel-head"><div><span class="panel-kicker">ESTADO</span><h3>Proteções</h3></div></div>
+            <div class="protection-list">
+              <div><span>Entradas</span><strong id="entriesState" class="pill">—</strong></div>
+              <div><span>Trava diária</span><strong id="dailyLockState" class="pill">—</strong></div>
+              <div><span>Maxx Nexus</span><strong id="nexusState" class="pill">—</strong></div>
+              <div><span>Bridge Testnet</span><strong id="bridgeState" class="pill">—</strong></div>
+            </div>
+          </article>
+          <article class="panel span-12">
+            <div class="panel-head"><div><span class="panel-kicker">AGORA</span><h3>Posições abertas</h3></div><button class="text-button" data-jump="positions">Ver detalhes →</button></div>
+            <div class="table-wrap"><table><thead><tr><th>Ativo</th><th>Entrada</th><th>Marca</th><th>Quantidade</th><th>Exposição</th><th>P&L</th><th>Stop ativo</th></tr></thead><tbody id="overviewPositions"></tbody></table></div>
+            <div id="overviewPositionsEmpty" class="empty hidden">Nenhuma posição PAPER aberta.</div>
+          </article>
+        </div>
+      </section>
+
+      <section id="orders" class="view" aria-labelledby="orders-title">
+        <div class="section-heading"><div><p class="eyebrow">EXECUÇÃO SIMULADA</p><h2 id="orders-title">Ordens PAPER</h2><p>Fills determinísticos registrados no banco local.</p></div><span class="warning-chip">NÃO ENVIADAS À BINANCE</span></div>
+        <article class="panel"><div class="table-wrap"><table><thead><tr><th>Horário</th><th>Ativo</th><th>Lado</th><th>Status</th><th>Referência</th><th>Fill simulado</th><th>Quantidade</th><th>Taxa</th><th>Resultado</th></tr></thead><tbody id="ordersTable"></tbody></table></div><div id="ordersEmpty" class="empty hidden">Ainda não existem entradas ou saídas PAPER.</div></article>
+      </section>
+
+      <section id="positions" class="view" aria-labelledby="positions-title">
+        <div class="section-heading"><div><p class="eyebrow">CARTEIRA SIMULADA</p><h2 id="positions-title">Posições</h2><p>Exposição, proteção e resultado por ativo.</p></div><div class="segmented"><button data-position-filter="open" class="active">Abertas</button><button data-position-filter="closed">Encerradas</button><button data-position-filter="all">Todas</button></div></div>
+        <div id="positionCards" class="position-grid"></div><div id="positionsEmpty" class="empty panel hidden">Nenhuma posição neste filtro.</div>
+      </section>
+
+      <section id="risk" class="view" aria-labelledby="risk-title">
+        <div class="section-heading"><div><p class="eyebrow">GUARDRAILS</p><h2 id="risk-title">Risco e capacidade</h2><p>Limites fixos da estratégia. Não editáveis nesta tela.</p></div></div>
+        <div class="metric-grid"><article class="metric-card"><span>Caixa PAPER</span><strong id="cash">—</strong></article><article class="metric-card"><span>Exposição bruta</span><strong id="grossExposure">—</strong></article><article class="metric-card"><span>P&L diário</span><strong id="dailyPnl">—</strong></article><article class="metric-card"><span>Posições</span><strong id="riskPositions">—</strong></article></div>
+        <div class="content-grid"><article class="panel span-7"><div class="panel-head"><div><span class="panel-kicker">UTILIZAÇÃO</span><h3>Limites da conta</h3></div></div><div class="gauge-list"><div><div><span>Capacidade de posições</span><strong id="positionGaugeLabel">—</strong></div><div class="progress"><span id="positionGauge"></span></div></div><div><div><span>Perda diária</span><strong id="lossGaugeLabel">—</strong></div><div class="progress danger"><span id="lossGauge"></span></div></div></div></article><article class="panel span-5"><div class="panel-head"><div><span class="panel-kicker">CONTRATO</span><h3>Configuração ativa</h3></div></div><dl class="details"><div><dt>Hash</dt><dd id="configHash">—</dd></div><div><dt>Nexus</dt><dd id="riskNexus">—</dd></div><div><dt>Probability gate</dt><dd id="probabilityGate">—</dd></div><div><dt>Dia de risco</dt><dd id="riskDay">—</dd></div></dl></article></div>
+      </section>
+
+      <section id="testnet" class="view" aria-labelledby="testnet-title">
+        <div class="section-heading"><div><p class="eyebrow">BRIDGE PRIVADO · READ ONLY</p><h2 id="testnet-title">Saldo Binance Spot Testnet</h2><p>Conta virtual separada do patrimônio PAPER.</p></div><div id="balanceFreshness" class="freshness" role="status" aria-live="polite">Aguardando Bridge</div></div>
+        <div class="boundary-note"><strong>Fronteira contábil</strong><span>Estes ativos não são somados ao patrimônio PAPER. “Bloqueado” é apenas o campo de saldo da Binance e não comprova ordem aberta.</span></div>
+        <div id="balanceCards" class="balance-grid"></div><div id="balanceEmpty" class="empty panel hidden">Nenhum saldo não zerado retornado pelo Bridge.</div><div id="bridgeUnavailable" class="empty panel hidden">Bridge indisponível. A operação PAPER continua normal.</div>
+      </section>
+
+      <section id="events" class="view" aria-labelledby="events-title">
+        <div class="section-heading"><div><p class="eyebrow">AUDITORIA</p><h2 id="events-title">Linha do tempo</h2><p>Decisões, bloqueios e operações simuladas.</p></div><button id="loadMoreEvents" class="secondary-button">Carregar mais</button></div><div id="eventsTimeline" class="timeline"></div><div id="eventsEmpty" class="empty panel hidden">Nenhum evento PAPER registrado.</div>
+      </section>
+
+      <section id="analysis" class="view" aria-labelledby="analysis-title">
+        <div class="section-heading"><div><p class="eyebrow">PESQUISA ASSISTIDA · PAPER</p><h2 id="analysis-title">Análise manual experimental</h2><p>Conteúdo para simulação PAPER, sujeito a erro e desatualização. Não é recomendação de compra ou venda.</p></div></div>
+        <div class="content-grid"><article class="panel span-12"><div id="manualFreshness" class="inline-status">Carregando ranking…</div><div class="control-row"><button id="refreshRanking" class="secondary-button">Atualizar observação</button><select id="manualSymbol" aria-label="Ativo do Top 10"></select><button id="analyzeManual" class="primary-button">Gerar análise PAPER</button></div></article><article class="panel span-7"><div class="panel-head"><h3>Relatório detalhado</h3></div><pre id="manualReport">—</pre></article><article class="panel span-5"><div class="panel-head"><h3>Histórico</h3></div><pre id="manualHistory">—</pre></article></div>
+      </section>
+
+      <section id="controls" class="view" aria-labelledby="controls-title">
+        <div class="section-heading"><div><p class="eyebrow">OPERAÇÃO CONTROLADA</p><h2 id="controls-title">Controles PAPER</h2><p>Somente ações predefinidas, autenticadas e auditáveis.</p></div></div>
+        <div class="content-grid"><article class="panel span-7"><div class="panel-head"><h3>Executar ciclo</h3></div><div id="job" class="inline-status" role="status" aria-live="polite">Nenhuma ação em execução.</div><div class="control-row"><button id="runObserve" class="secondary-button">Executar OBSERVATION</button><button id="runPaper" class="primary-button">Executar ciclo PAPER simulado</button></div><hr><label for="pauseReason">Motivo da pausa</label><input id="pauseReason" maxlength="200" placeholder="Ex.: revisão operacional"><div class="control-row"><button id="pauseEntries" class="danger-button">Pausar entradas</button><button id="resumeEntries" class="secondary-button">Retomar entradas</button></div></article><article class="panel span-5"><div class="panel-head"><h3>Exportar evidências</h3></div><div class="download-list"><a href="/api/export?kind=paper">Relatório PAPER <span>JSON ↓</span></a><a href="/api/export?kind=observation">Observação <span>JSON ↓</span></a></div><p class="subtle">Não existe terminal, comando arbitrário ou botão de ordem.</p></article><article class="panel span-12"><div class="panel-head"><h3>Configuração validada</h3><span class="subtle">Somente leitura</span></div><pre id="config">Carregando…</pre></article></div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
