@@ -17,7 +17,9 @@
         <div><strong>MAXX</strong><span>Command Center</span></div>
       </div>
       <nav class="nav-list">
-        <button class="nav-item active" data-view="overview"><span aria-hidden="true">⌂</span>Visão geral</button>
+        <button class="nav-item active" data-view="overview" aria-current="page"><span aria-hidden="true">⌂</span>Visão geral</button>
+        <button class="nav-item" data-view="results"><span aria-hidden="true">▥</span>Resultados</button>
+        <button class="nav-item" data-view="trends"><span aria-hidden="true">⌁</span>Tendências</button>
         <button class="nav-item" data-view="orders"><span aria-hidden="true">⇄</span>Ordens PAPER</button>
         <button class="nav-item" data-view="positions"><span aria-hidden="true">◎</span>Posições</button>
         <button class="nav-item" data-view="risk"><span aria-hidden="true">◇</span>Risco</button>
@@ -87,6 +89,17 @@
             <div id="overviewPositionsEmpty" class="empty hidden">Nenhuma posição PAPER aberta.</div>
           </article>
         </div>
+      </section>
+
+      <section id="results" class="view" aria-labelledby="results-title">
+        <div class="section-heading"><div><p class="eyebrow">DESEMPENHO PAPER</p><h2 id="results-title">Resultados</h2><p>Métricas de operações simuladas no período selecionado.</p></div></div>
+        <div class="metric-grid"><article class="metric-card"><span>Trades encerrados</span><strong id="closedTrades">—</strong></article><article class="metric-card"><span>Taxa de acerto</span><strong id="winRate">—</strong></article><article class="metric-card"><span>Melhor ativo</span><strong id="bestAsset">—</strong></article><article class="metric-card"><span>Pior ativo</span><strong id="worstAsset">—</strong></article></div>
+        <div class="content-grid"><article class="panel span-12"><div class="panel-head"><h3>Resultado por ativo</h3></div><div class="table-wrap"><table><thead><tr><th>Ativo</th><th>Trades</th><th>Vitórias</th><th>Perdas</th><th>P&L realizado</th></tr></thead><tbody id="assetPerformance"></tbody></table></div><div id="assetPerformanceEmpty" class="empty hidden">Nenhum trade PAPER encerrado no período.</div></article><article class="panel span-12"><div class="panel-head"><h3>Resultados diários</h3></div><div class="table-wrap"><table><thead><tr><th>Dia UTC</th><th>Patrimônio</th><th>P&L diário</th><th>Variação</th></tr></thead><tbody id="dailyResults"></tbody></table></div><div id="dailyResultsEmpty" class="empty hidden">Nenhum relatório PAPER no período.</div></article></div>
+      </section>
+
+      <section id="trends" class="view" aria-labelledby="trends-title">
+        <div class="section-heading"><div><p class="eyebrow">OBSERVAÇÃO PÚBLICA</p><h2 id="trends-title">Tendências</h2><p>Ranking e sinais observacionais; não constituem ordem nem recomendação.</p></div></div>
+        <div class="content-grid"><article class="panel span-7"><div class="panel-head"><h3>Ranking elegível</h3></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Ativo</th><th>Score</th><th>30 dias</th></tr></thead><tbody id="eligibleRanking"></tbody></table></div><div id="eligibleRankingEmpty" class="empty hidden">Nenhum ativo elegível na observação atual.</div></article><article class="panel span-5"><div class="panel-head"><h3>Tendências e sinais</h3></div><div id="emergingTrends" class="timeline"></div><div id="emergingTrendsEmpty" class="empty hidden">Nenhum novo sinal observado.</div></article><article class="panel span-12"><div class="panel-head"><h3>Rejeições de dados</h3></div><pre id="dataRejections">—</pre></article></div>
       </section>
 
       <section id="orders" class="view" aria-labelledby="orders-title">

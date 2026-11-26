@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -49,6 +50,74 @@ class UnifiedDeploymentPreflightTests(unittest.TestCase):
             self.assertNotEqual(dashboard, bridge)
             self.preflight._validate_sources(self.root)
             self.preflight._validate_secrets(secrets)
+
+    def test_rejects_secret_or_network_attached_to_the_wrong_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy(self.root / "Dockerfile.dashboard", root / "Dockerfile.dashboard")
+            compose = (self.root / "compose.unified.yml").read_text(encoding="utf-8")
+            compose = compose.replace(
+                "    secrets:\n      - dashboard_auth_token\n      - bridge_auth_token",
+                "    secrets:\n      - dashboard_auth_token\n      - bridge_auth_token\n      - binance_testnet_api_key",
+                1,
+            )
+            (root / "compose.unified.yml").write_text(compose, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "dashboard secret boundary"):
+                self.preflight._validate_sources(root)
+
+    def test_nested_decoy_cannot_satisfy_direct_image_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy(self.root / "Dockerfile.dashboard", root / "Dockerfile.dashboard")
+            compose = (self.root / "compose.unified.yml").read_text(encoding="utf-8")
+            compose = compose.replace(
+                "    image: ${PAPER_DASHBOARD_IMAGE:?set an immutable digest-pinned dashboard image}",
+                "    image: attacker/dashboard:latest\n    labels:\n      image: ${PAPER_DASHBOARD_IMAGE:?decoy}",
+            )
+            (root / "compose.unified.yml").write_text(compose, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "dashboard image must be immutable"):
+                self.preflight._validate_sources(root)
+
+    def test_duplicate_critical_mapping_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy(self.root / "Dockerfile.dashboard", root / "Dockerfile.dashboard")
+            compose = (self.root / "compose.unified.yml").read_text(encoding="utf-8")
+            compose = compose.replace("  bridge_private:\n    internal: true", "  bridge_private:\n    internal: true\n  bridge_private:\n    internal: false")
+            (root / "compose.unified.yml").write_text(compose, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "duplicate bridge_private"):
+                self.preflight._validate_sources(root)
+
+    def test_comment_cannot_satisfy_a_missing_private_network_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy(self.root / "Dockerfile.dashboard", root / "Dockerfile.dashboard")
+            compose = (self.root / "compose.unified.yml").read_text(encoding="utf-8")
+            compose = compose.replace("  bridge_private:\n    internal: true", "  bridge_private:\n    # internal: true")
+            (root / "compose.unified.yml").write_text(compose, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "bridge_private must be internal"):
+                self.preflight._validate_sources(root)
+
+    def test_rejects_changed_top_level_secret_file_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy(self.root / "Dockerfile.dashboard", root / "Dockerfile.dashboard")
+            compose = (self.root / "compose.unified.yml").read_text(encoding="utf-8")
+            compose = compose.replace(
+                "    file: ./secrets/binance_testnet_api_key",
+                "    file: ./other/unvalidated_api_key",
+            )
+            (root / "compose.unified.yml").write_text(compose, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "secret file binding"):
+                self.preflight._validate_sources(root)
+
+    def test_secrets_directory_must_match_the_compose_bound_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = root / "secrets"
+            self.preflight._validate_secret_directory_binding(root, expected)
+            with self.assertRaisesRegex(ValueError, "Compose-bound"):
+                self.preflight._validate_secret_directory_binding(root, root / "other-secrets")
 
     def test_cli_requires_secret_directory_for_a_complete_preflight(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

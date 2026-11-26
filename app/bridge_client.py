@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import http.client
 import json
 import socket
 import ssl
@@ -80,6 +81,7 @@ class BridgeBalanceClient:
         *,
         opener: OpenerDirector | None = None,
         clock: Callable[[], float] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
         cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
         max_stale_seconds: int = DEFAULT_MAX_STALE_SECONDS,
@@ -93,7 +95,8 @@ class BridgeBalanceClient:
             raise ValueError("invalid Bridge cache policy")
         self._token = token
         self._opener = opener if opener is not None else _direct_opener()
-        self._clock = clock if clock is not None else time.time
+        self._wall_clock = clock if clock is not None else time.time
+        self._monotonic_clock = monotonic_clock if monotonic_clock is not None else time.monotonic
         self._timeout = timeout_seconds
         self._cache_ttl = cache_ttl_seconds
         self._max_stale = max_stale_seconds
@@ -115,7 +118,7 @@ class BridgeBalanceClient:
         return result
 
     def balance(self) -> dict[str, Any]:
-        now = self._clock()
+        now = self._monotonic_clock()
         cached = self._cached_result(now, allow_stale=False)
         if cached is not None:
             return cached
@@ -125,20 +128,20 @@ class BridgeBalanceClient:
                 return cached
             raise BridgeUnavailable("Bridge balance request is already in progress")
         try:
-            now = self._clock()
+            now = self._monotonic_clock()
             cached = self._cached_result(now, allow_stale=False)
             if cached is not None:
                 return cached
             try:
                 normalized = self._fetch()
             except BridgeUnavailable:
-                stale = self._cached_result(self._clock(), allow_stale=True)
+                stale = self._cached_result(self._monotonic_clock(), allow_stale=True)
                 if stale is not None:
                     stale["status"] = "stale"
                     stale["stale"] = True
                     return stale
                 raise
-            fetched_at_ms = int(self._clock() * 1000)
+            fetched_at_ms = int(self._wall_clock() * 1000)
             result = {
                 "schema_version": "dashboard.testnet-balance.v1",
                 "source": "binance-testnet-bridge",
@@ -153,7 +156,7 @@ class BridgeBalanceClient:
                 "balances": normalized["balances"],
             }
             self._cached = result
-            self._cached_at = self._clock()
+            self._cached_at = self._monotonic_clock()
             return dict(result)
         finally:
             self._lock.release()
@@ -182,7 +185,7 @@ class BridgeBalanceClient:
             if exc.code == 429:
                 raise BridgeUnavailable("Bridge balance request was rate limited") from None
             raise BridgeUnavailable(f"Bridge returned HTTP {exc.code}") from None
-        except (URLError, socket.timeout, TimeoutError):
+        except (URLError, socket.timeout, TimeoutError, http.client.HTTPException):
             raise BridgeUnavailable("Bridge is temporarily unavailable") from None
         except OSError:
             raise BridgeUnavailable("Bridge connection failed") from None
@@ -190,7 +193,7 @@ class BridgeBalanceClient:
             raise BridgeUnavailable("Bridge response exceeded the size limit")
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             raise BridgeUnavailable("Bridge returned invalid JSON") from None
         return self._validate_payload(payload)
 
